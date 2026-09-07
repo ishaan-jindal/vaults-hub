@@ -6,24 +6,33 @@ so opencode can read/write/search all vaults with no Obsidian windows, ports,
 or API keys involved. Spawned per-session by opencode over stdio.
 """
 
-from __future__ import annotations
-
+import asyncio
+import contextlib
+import fcntl
+import fnmatch
 import json
+import hashlib
 import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
+import threading
 from datetime import date
 from pathlib import Path
 
+import anyio
+import mcp.types as mcp_types
 import yaml
-from mcp.server.mcpserver import MCPServer
+from mcp.server.fastmcp import FastMCP
+from mcp.shared.message import SessionMessage
 
 VAULTS_ROOT = Path(
     os.environ.get("VAULTS_ROOT", str(Path.home() / "Dev" / "vaults"))
 ).resolve()
 
-mcp = MCPServer("vaults")
+mcp = FastMCP("vaults")
 
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?", re.DOTALL)
 WIKI_LINK_RE = re.compile(r"!?\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
@@ -50,6 +59,55 @@ def _note_path(root: Path, rel: str) -> Path:
     if p != root and root not in p.parents:
         raise ValueError(f"path escapes vault: {rel!r}")
     return p
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _read_text(path: Path) -> str:
+    """Read a note as UTF-8, replacing invalid bytes instead of crashing."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_bytes().decode("utf-8", errors="replace")
+
+
+@contextlib.contextmanager
+def _note_lock(path: Path):
+    """Serialize read-modify-write across processes via an flock'd lock file.
+
+    The note itself is replaced by _atomic_write, so locking the note's inode
+    would not survive the swap; a sibling ``.<name>.lock`` file avoids that.
+    """
+    lock_path = path.parent / f".{path.name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Replace a note without exposing a partially written file."""
+    fd, temporary_path = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(content)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _split_frontmatter(text: str) -> tuple[dict, str]:
@@ -112,7 +170,7 @@ def _link_info(
 
 def _link_targets(root: Path, p: Path) -> set[Path]:
     try:
-        text = p.read_text(encoding="utf-8")
+        text = _read_text(p)
     except OSError:
         return set()
     out = set()
@@ -165,7 +223,7 @@ def read_note(vault: str, path: str) -> dict:
     p = _note_path(root, path)
     if not p.is_file():
         raise ValueError(f"note not found: {path!r}")
-    text = p.read_text(encoding="utf-8")
+    text = _read_text(p)
     frontmatter, _ = _split_frontmatter(text)
     links, backlinks, unresolved = _link_info(root, p.resolve(), text)
     return {
@@ -173,43 +231,117 @@ def read_note(vault: str, path: str) -> dict:
         "path": _rel(root, p),
         "frontmatter": frontmatter,
         "content": text,
+        "sha256": _sha256(text),
         "links": links,
         "backlinks": backlinks,
         "unresolved_links": unresolved,
     }
 
 
-@mcp.tool(
-    description="Create or overwrite a note (vault-root-relative path). Refreshes frontmatter `updated:` date."
-)
-def write_note(vault: str, path: str, content: str) -> dict:
-    root = _vault_root(vault)
-    p = _note_path(root, path)
+def _write_note_locked(
+    root: Path, p: Path, content: str, expected_sha256: str | None
+) -> dict:
+    """Write under an acquired lock. Callers must hold _note_lock(p)."""
     if p.suffix != ".md":
         raise ValueError("note path must end in .md")
+    if p.is_dir():
+        raise ValueError(f"note path is a directory: {p.name!r}")
     p.parent.mkdir(parents=True, exist_ok=True)
+    previous = _read_text(p) if p.is_file() else None
+    previous_sha256 = _sha256(previous) if previous is not None else None
+    if expected_sha256 is not None and expected_sha256 != previous_sha256:
+        raise ValueError(
+            "note has changed since the supplied expected_sha256; read it again before writing"
+        )
     content, refreshed = _refresh_updated(content)
-    p.write_text(content, encoding="utf-8")
+    _atomic_write(p, content)
     return {
-        "vault": vault,
+        "vault": root.name,
         "path": _rel(root, p),
         "bytes": len(content.encode()),
+        "previous_sha256": previous_sha256,
+        "sha256": _sha256(content),
         "updated_refreshed": refreshed,
     }
 
 
 @mcp.tool(
-    description="Append text to a note (created if missing). Refreshes frontmatter `updated:` date."
+    description=(
+        "Create or atomically overwrite a note (vault-root-relative path). "
+        "Pass sha256 from a prior read/write as expected_sha256 to prevent "
+        "overwriting a changed note. Refreshes frontmatter `updated:` date."
+    )
 )
-def append_note(vault: str, path: str, text: str) -> dict:
+def write_note(
+    vault: str, path: str, content: str, expected_sha256: str | None = None
+) -> dict:
+    root = _vault_root(vault)
+    p = _note_path(root, path)
+    with _note_lock(p):
+        return _write_note_locked(root, p, content, expected_sha256)
+
+
+@mcp.tool(
+    description=(
+        "Append text to a note (created if missing) via an atomic write. "
+        "Optionally pass expected_sha256 to prevent appending to a changed note. "
+        "Refreshes frontmatter `updated:` date."
+    )
+)
+def append_note(
+    vault: str, path: str, text: str, expected_sha256: str | None = None
+) -> dict:
     root = _vault_root(vault)
     p = _note_path(root, path)
     if p.suffix != ".md":
         raise ValueError("note path must end in .md")
-    current = p.read_text(encoding="utf-8") if p.is_file() else ""
-    if current and not current.endswith("\n"):
-        current += "\n"
-    return write_note(vault, path, current + text)
+    with _note_lock(p):
+        current = _read_text(p) if p.is_file() else ""
+        if current and not current.endswith("\n"):
+            current += "\n"
+        return _write_note_locked(root, p, current + text, expected_sha256)
+
+
+def _gitignore_patterns(root: Path) -> list[str]:
+    gi = root / ".gitignore"
+    if not gi.is_file():
+        return []
+    try:
+        return [
+            ln.strip()
+            for ln in gi.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+    except OSError:
+        return []
+
+
+def _gitignored(root: Path, p: Path, patterns: list[str]) -> bool:
+    """Minimal .gitignore matching for the Python search fallback."""
+    rel = _rel(root, p)
+    for raw in patterns:
+        if raw.startswith("!"):
+            continue
+        anchored = raw.startswith("/")
+        pat = raw.lstrip("/")
+        dir_only = pat.endswith("/")
+        pat = pat.rstrip("/")
+        if dir_only:
+            if rel.startswith(pat + "/"):
+                return True
+            continue
+        if "*" not in pat:
+            if anchored:
+                if rel == pat or rel.startswith(pat + "/"):
+                    return True
+            elif pat in rel.split("/"):
+                return True
+        elif anchored:
+            if fnmatch.fnmatch(rel, pat):
+                return True
+        elif any(fnmatch.fnmatch(part, pat) for part in rel.split("/")):
+            return True
+    return False
 
 
 @mcp.tool(
@@ -263,12 +395,17 @@ def search_notes(
     else:  # fallback: plain Python scan
         flags = 0 if case_sensitive else re.IGNORECASE
         pat = re.compile(query if regex else re.escape(query), flags)
+        per_file_limit = 20
         for root in roots:
+            ignore = _gitignore_patterns(root)
             for p in _all_notes(root):
+                if _gitignored(root, p, ignore):
+                    continue
                 try:
-                    lines = p.read_text(encoding="utf-8").splitlines()
+                    lines = _read_text(p).splitlines()
                 except OSError:
                     continue
+                file_hits = 0
                 for i, ln in enumerate(lines, 1):
                     if pat.search(ln):
                         hits.append(
@@ -279,6 +416,9 @@ def search_notes(
                                 "text": ln.strip(),
                             }
                         )
+                        file_hits += 1
+                        if file_hits >= per_file_limit:
+                            break
                         if len(hits) >= limit:
                             break
                 if len(hits) >= limit:
@@ -286,5 +426,74 @@ def search_notes(
     return {"query": query, "matches": hits[:limit]}
 
 
+async def _serve_stdio() -> None:
+    """Run MCP over stdio without AnyIO's broken wrapped-file iterator.
+
+    The project runtime's AnyIO version blocks forever when iterating an
+    ``anyio.wrap_file(TextIOWrapper(sys.stdin.buffer))`` stream. The official
+    MCP stdio adapter relies on that operation, so we bridge blocking stdio
+    reads through a standard-library thread while leaving MCP protocol handling
+    to the SDK.
+    """
+    read_sender, read_stream = anyio.create_memory_object_stream[
+        SessionMessage | Exception
+    ](32)
+    write_sender, write_stream = anyio.create_memory_object_stream[SessionMessage](32)
+
+    async def write_stdout() -> None:
+        async with write_stream:
+            async for session_message in write_stream:
+                payload = (
+                    session_message.message.model_dump_json(
+                        by_alias=True, exclude_none=True
+                    )
+                    + "\n"
+                )
+                _write_stdout(payload)
+
+    async with anyio.create_task_group() as task_group:
+        _start_stdin_bridge(asyncio.get_running_loop(), read_sender)
+        task_group.start_soon(write_stdout)
+        try:
+            await mcp._mcp_server.run(  # noqa: SLF001 - FastMCP's protocol server
+                read_stream,
+                write_sender,
+                mcp._mcp_server.create_initialization_options(),
+            )
+        finally:
+            await write_sender.aclose()
+            task_group.cancel_scope.cancel()
+
+
+def _write_stdout(payload: str) -> None:
+    sys.stdout.write(payload)
+    sys.stdout.flush()
+
+
+def _start_stdin_bridge(
+    event_loop: asyncio.AbstractEventLoop,
+    sender: anyio.abc.ObjectSendStream[SessionMessage | Exception],
+) -> None:
+    """Forward stdin in a stdlib thread, since AnyIO worker threads hang here."""
+
+    def forward() -> None:
+        try:
+            for line in sys.stdin.buffer:
+                try:
+                    item: SessionMessage | Exception = SessionMessage(
+                        mcp_types.JSONRPCMessage.model_validate_json(line)
+                    )
+                except Exception as exc:
+                    item = exc
+                asyncio.run_coroutine_threadsafe(sender.send(item), event_loop).result()
+        finally:
+            try:
+                asyncio.run_coroutine_threadsafe(sender.aclose(), event_loop).result()
+            except RuntimeError:
+                pass
+
+    threading.Thread(target=forward, name="mcp-stdin", daemon=True).start()
+
+
 if __name__ == "__main__":
-    mcp.run()
+    anyio.run(_serve_stdio)

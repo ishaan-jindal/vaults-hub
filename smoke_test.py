@@ -1,8 +1,9 @@
-"""End-to-end smoke test for the vaults hub: spawns server.py over stdio."""
+"""End-to-end smoke test for the vaults hub over a temporary stdio MCP server."""
 
 import asyncio
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -10,13 +11,12 @@ from mcp.client.stdio import stdio_client
 
 HERE = Path(__file__).resolve().parent
 SERVER = HERE / "server.py"
-SCRATCH = ("Termchat", "08-Changelog/_hub-smoke.md")
 
 
 def out(res):
     data = (
-        res.structured_content
-        if res.structured_content is not None
+        res.structuredContent
+        if res.structuredContent is not None
         else json.loads(res.content[0].text)
     )
     if isinstance(data, dict) and set(data) == {"result"}:
@@ -24,87 +24,124 @@ def out(res):
     return data
 
 
+def write_fixture(root: Path) -> None:
+    (root / "Termchat").mkdir()
+    (root / "Runnix").mkdir()
+    (root / "Termchat" / "Termchat.md").write_text(
+        "---\ntitle: Termchat Home\nupdated: 2000-01-01\n---\n"
+        "\n[[Architecture]] and [[Missing]]\n",
+        encoding="utf-8",
+    )
+    (root / "Termchat" / "Architecture.md").write_text(
+        "# Architecture\n\n[[Termchat]]\n", encoding="utf-8"
+    )
+    (root / "Termchat" / "Broken.md").write_bytes(b"\xff\xfe broken bytes \x00\x01")
+    (root / "Runnix" / "notes.md").write_text("Runnix is ready.\n", encoding="utf-8")
+
+
 async def main() -> int:
-    params = StdioServerParameters(command=sys.executable, args=[str(SERVER)])
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as s:
-            await s.initialize()
+    with tempfile.TemporaryDirectory(prefix="vaults-hub-") as temp_dir:
+        vaults = Path(temp_dir)
+        write_fixture(vaults)
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[str(SERVER)],
+            env={"VAULTS_ROOT": str(vaults), "PYTHONUNBUFFERED": "1"},
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                print("initialized")
 
-            tools = sorted(t.name for t in (await s.list_tools()).tools)
-            print("tools:", tools)
-            assert tools == [
-                "append_note",
-                "list_notes",
-                "list_vaults",
-                "read_note",
-                "search_notes",
-                "write_note",
-            ], tools
-
-            vaults = out(await s.call_tool("list_vaults", {}))
-            print("vaults:", vaults)
-            by_name = {v["name"]: v["notes"] for v in vaults}
-            expected = {
-                d.name: len([p for p in d.rglob("*.md") if ".obsidian" not in p.parts])
-                for d in (HERE.parent / "vaults").iterdir()
-                if d.is_dir()
-            }
-            assert by_name == expected, (by_name, expected)
-
-            home = out(
-                await s.call_tool(
-                    "read_note", {"vault": "Termchat", "path": "Termchat.md"}
-                )
-            )
-            assert home["frontmatter"].get("title") == "Termchat Home", home[
-                "frontmatter"
-            ]
-            assert "Architecture" in home["links"], home["links"]
-            assert home["unresolved_links"] == [], home["unresolved_links"]
-            disk = (HERE.parent / "vaults" / "Termchat" / "Termchat.md").read_text()
-            assert home["content"] == disk, "hub content must byte-match disk"
-
-            hits = out(
-                await s.call_tool(
-                    "search_notes", {"query": "Runnix", "vault": "Runnix"}
-                )
-            )
-            assert hits["matches"], "expected search hits in Runnix"
-            print("sample hit:", hits["matches"][0])
-
-            body = "---\ntitle: Hub Smoke\nupdated: 2000-01-01\n---\n\nsmoke\n"
-            w = out(
-                await s.call_tool(
-                    "write_note",
-                    {"vault": SCRATCH[0], "path": SCRATCH[1], "content": body},
-                )
-            )
-            assert w["updated_refreshed"] is True, w
-            back = out(
-                await s.call_tool(
-                    "read_note", {"vault": SCRATCH[0], "path": SCRATCH[1]}
-                )
-            )
-            assert "updated: 2000-01-01" not in back["content"], (
-                "updated date must be refreshed"
-            )
-            a = out(
-                await s.call_tool(
+                tools = sorted(tool.name for tool in (await session.list_tools()).tools)
+                assert tools == [
                     "append_note",
-                    {"vault": SCRATCH[0], "path": SCRATCH[1], "text": "more\n"},
-                )
-            )
-            assert a["bytes"] > w["bytes"], (a, w)
-            (HERE.parent / "vaults" / SCRATCH[0] / SCRATCH[1]).unlink()
-            print("write/append round-trip ok (scratch removed)")
+                    "list_notes",
+                    "list_vaults",
+                    "read_note",
+                    "search_notes",
+                    "write_note",
+                ], tools
 
-            res = await s.call_tool(
-                "read_note", {"vault": "Termchat", "path": "../x.md"}
-            )
-            print("is_error:", res.is_error)
-            print("content:", res.content)
-            assert res.is_error, "path traversal was NOT rejected"
-            print("traversal guard ok")
+                listed = out(await session.call_tool("list_vaults", {}))
+                assert {item["name"]: item["notes"] for item in listed} == {
+                    "Runnix": 1,
+                    "Termchat": 3,
+                }
+
+                home = out(
+                    await session.call_tool(
+                        "read_note", {"vault": "Termchat", "path": "Termchat.md"}
+                    )
+                )
+                assert home["frontmatter"]["title"] == "Termchat Home"
+                assert home["links"] == ["Architecture"]
+                assert home["backlinks"] == ["Architecture.md"]
+                assert home["unresolved_links"] == ["Missing"]
+
+                broken = await session.call_tool(
+                    "read_note", {"vault": "Termchat", "path": "Broken.md"}
+                )
+                assert not broken.isError, "non-UTF-8 note must not crash read_note"
+
+                hits = out(
+                    await session.call_tool(
+                        "search_notes", {"query": "Runnix", "vault": "Runnix"}
+                    )
+                )
+                assert hits["matches"], "expected fixture search hit"
+
+                body = "---\ntitle: Hub Smoke\nupdated: 2000-01-01\n---\n\nsmoke\n"
+                created = out(
+                    await session.call_tool(
+                        "write_note",
+                        {"vault": "Termchat", "path": "Scratch.md", "content": body},
+                    )
+                )
+                assert created["previous_sha256"] is None
+                assert len(created["sha256"]) == 64
+                assert "updated: 2000-01-01" not in (
+                    vaults / "Termchat" / "Scratch.md"
+                ).read_text(encoding="utf-8")
+
+                appended = out(
+                    await session.call_tool(
+                        "append_note",
+                        {
+                            "vault": "Termchat",
+                            "path": "Scratch.md",
+                            "text": "more\n",
+                            "expected_sha256": created["sha256"],
+                        },
+                    )
+                )
+                assert appended["previous_sha256"] == created["sha256"]
+
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "Scratch.md",
+                        "content": "external\n",
+                    },
+                )
+                conflict = await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "Scratch.md",
+                        "content": "stale\n",
+                        "expected_sha256": appended["sha256"],
+                    },
+                )
+                assert conflict.isError, "stale write was not rejected"
+                assert not list((vaults / "Termchat").glob(".Scratch.md.*.tmp"))
+
+                traversal = await session.call_tool(
+                    "read_note", {"vault": "Termchat", "path": "../outside.md"}
+                )
+                assert traversal.isError, "path traversal was not rejected"
+                print("MCP operations OK")
 
     print("SMOKE OK")
     return 0
