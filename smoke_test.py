@@ -56,8 +56,11 @@ async def main() -> int:
                 tools = sorted(tool.name for tool in (await session.list_tools()).tools)
                 assert tools == [
                     "append_note",
+                    "delete_note",
                     "list_notes",
+                    "list_tags",
                     "list_vaults",
+                    "move_note",
                     "read_note",
                     "search_notes",
                     "write_note",
@@ -141,6 +144,200 @@ async def main() -> int:
                     "read_note", {"vault": "Termchat", "path": "../outside.md"}
                 )
                 assert traversal.isError, "path traversal was not rejected"
+
+                # F: recursive list_notes
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "Sub/inner.md",
+                        "content": "inner\n",
+                    },
+                )
+                flat = out(
+                    await session.call_tool(
+                        "list_notes", {"vault": "Termchat", "path": ""}
+                    )
+                )
+                assert "Sub/inner.md" not in flat["notes"], flat
+                rec = out(
+                    await session.call_tool(
+                        "list_notes",
+                        {"vault": "Termchat", "path": "", "recursive": True},
+                    )
+                )
+                assert rec["dirs"] == [], rec
+                assert "Sub/inner.md" in rec["notes"], rec
+
+                # D + G: tags (list form + string form, normalized to list)
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "TagList.md",
+                        "content": "---\ntags: [a/b, c]\n---\nbody\n",
+                    },
+                )
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "TagStr.md",
+                        "content": "---\ntags: d\n---\nbody\n",
+                    },
+                )
+                tag_counts = out(
+                    await session.call_tool("list_tags", {"vault": "Termchat"})
+                )
+                assert tag_counts["Termchat"].get("a/b") == 1, tag_counts
+                assert tag_counts["Termchat"].get("c") == 1, tag_counts
+                assert tag_counts["Termchat"].get("d") == 1, tag_counts
+                tag_str = out(
+                    await session.call_tool(
+                        "read_note", {"vault": "Termchat", "path": "TagStr.md"}
+                    )
+                )
+                assert tag_str["frontmatter"]["tags"] == ["d"], tag_str
+                tag_list = out(
+                    await session.call_tool(
+                        "read_note", {"vault": "Termchat", "path": "TagList.md"}
+                    )
+                )
+                assert tag_list["frontmatter"]["tags"] == ["a/b", "c"], tag_list
+
+                # E: search context
+                ctx_body = "l1\nl2\nl3 target\nl4\nl5\n"
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "Context.md",
+                        "content": ctx_body,
+                    },
+                )
+                ctx = out(
+                    await session.call_tool(
+                        "search_notes",
+                        {
+                            "query": "l3 target",
+                            "vault": "Termchat",
+                            "before": 2,
+                            "after": 2,
+                        },
+                    )
+                )
+                assert ctx["matches"], "expected context search hit"
+                hit = next(m for m in ctx["matches"] if m["path"] == "Context.md")
+                assert hit["before_lines"] == ["l1", "l2"], hit
+                assert hit["match_line"] == "l3 target", hit
+                assert hit["after_lines"] == ["l4", "l5"], hit
+                assert hit["text"] == hit["match_line"], hit
+
+                # C: delete_note + move_note
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "ToDelete.md",
+                        "content": "bye\n",
+                    },
+                )
+                deleted = out(
+                    await session.call_tool(
+                        "delete_note",
+                        {"vault": "Termchat", "path": "ToDelete.md"},
+                    )
+                )
+                assert len(deleted["sha256_before"]) == 64, deleted
+                gone = await session.call_tool(
+                    "read_note", {"vault": "Termchat", "path": "ToDelete.md"}
+                )
+                assert gone.isError, "deleted note still readable"
+                missing = await session.call_tool(
+                    "delete_note",
+                    {"vault": "Termchat", "path": "ToDelete.md"},
+                )
+                assert missing.isError, "missing delete was not rejected"
+                missing_ok = out(
+                    await session.call_tool(
+                        "delete_note",
+                        {
+                            "vault": "Termchat",
+                            "path": "ToDelete.md",
+                            "missing_ok": True,
+                        },
+                    )
+                )
+                assert missing_ok["sha256_before"] is None, missing_ok
+                # backlinks follow a move (source path updates on target)
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "Linker.md",
+                        "content": "hello\n",
+                    },
+                )
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "OldName.md",
+                        "content": "[[Linker]]\n",
+                    },
+                )
+                linker_before = out(
+                    await session.call_tool(
+                        "read_note", {"vault": "Termchat", "path": "Linker.md"}
+                    )
+                )
+                assert linker_before["backlinks"] == ["OldName.md"], linker_before
+                moved = out(
+                    await session.call_tool(
+                        "move_note",
+                        {
+                            "vault": "Termchat",
+                            "src_path": "OldName.md",
+                            "dst_path": "NewName.md",
+                        },
+                    )
+                )
+                assert moved["dst_path"] == "NewName.md", moved
+                assert len(moved["sha256"]) == 64, moved
+                old_gone = await session.call_tool(
+                    "read_note", {"vault": "Termchat", "path": "OldName.md"}
+                )
+                assert old_gone.isError, "move source still readable"
+                new = out(
+                    await session.call_tool(
+                        "read_note", {"vault": "Termchat", "path": "NewName.md"}
+                    )
+                )
+                assert new["links"] == ["Linker"], new
+                linker_after = out(
+                    await session.call_tool(
+                        "read_note", {"vault": "Termchat", "path": "Linker.md"}
+                    )
+                )
+                assert linker_after["backlinks"] == ["NewName.md"], linker_after
+                bad_src = await session.call_tool(
+                    "move_note",
+                    {
+                        "vault": "Termchat",
+                        "src_path": "Nope.md",
+                        "dst_path": "Elsewhere.md",
+                    },
+                )
+                assert bad_src.isError, "missing move source not rejected"
+                bad_dst = await session.call_tool(
+                    "move_note",
+                    {
+                        "vault": "Termchat",
+                        "src_path": "NewName.md",
+                        "dst_path": "Termchat.md",
+                    },
+                )
+                assert bad_dst.isError, "existing destination not rejected"
                 print("MCP operations OK")
 
     print("SMOKE OK")
