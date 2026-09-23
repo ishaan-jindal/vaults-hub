@@ -28,8 +28,7 @@ def write_fixture(root: Path) -> None:
     (root / "Termchat").mkdir()
     (root / "Runnix").mkdir()
     (root / "Termchat" / "Termchat.md").write_text(
-        "---\ntitle: Termchat Home\nupdated: 2000-01-01\n---\n"
-        "\n[[Architecture]] and [[Missing]]\n",
+        "---\ntitle: Termchat Home\nupdated: 2000-01-01\n---\n\n[[Architecture]] and [[Missing]]\n",
         encoding="utf-8",
     )
     (root / "Termchat" / "Architecture.md").write_text(
@@ -57,11 +56,13 @@ async def main() -> int:
                 assert tools == [
                     "append_note",
                     "delete_note",
+                    "history",
                     "list_notes",
                     "list_tags",
                     "list_vaults",
                     "move_note",
                     "read_note",
+                    "restore",
                     "search_notes",
                     "write_note",
                 ], tools
@@ -88,9 +89,7 @@ async def main() -> int:
                 assert not broken.isError, "non-UTF-8 note must not crash read_note"
 
                 hits = out(
-                    await session.call_tool(
-                        "search_notes", {"query": "Runnix", "vault": "Runnix"}
-                    )
+                    await session.call_tool("search_notes", {"query": "Runnix", "vault": "Runnix"})
                 )
                 assert hits["matches"], "expected fixture search hit"
 
@@ -103,9 +102,9 @@ async def main() -> int:
                 )
                 assert created["previous_sha256"] is None
                 assert len(created["sha256"]) == 64
-                assert "updated: 2000-01-01" not in (
-                    vaults / "Termchat" / "Scratch.md"
-                ).read_text(encoding="utf-8")
+                assert "updated: 2000-01-01" not in (vaults / "Termchat" / "Scratch.md").read_text(
+                    encoding="utf-8"
+                )
 
                 appended = out(
                     await session.call_tool(
@@ -154,11 +153,7 @@ async def main() -> int:
                         "content": "inner\n",
                     },
                 )
-                flat = out(
-                    await session.call_tool(
-                        "list_notes", {"vault": "Termchat", "path": ""}
-                    )
-                )
+                flat = out(await session.call_tool("list_notes", {"vault": "Termchat", "path": ""}))
                 assert "Sub/inner.md" not in flat["notes"], flat
                 rec = out(
                     await session.call_tool(
@@ -186,16 +181,12 @@ async def main() -> int:
                         "content": "---\ntags: d\n---\nbody\n",
                     },
                 )
-                tag_counts = out(
-                    await session.call_tool("list_tags", {"vault": "Termchat"})
-                )
+                tag_counts = out(await session.call_tool("list_tags", {"vault": "Termchat"}))
                 assert tag_counts["Termchat"].get("a/b") == 1, tag_counts
                 assert tag_counts["Termchat"].get("c") == 1, tag_counts
                 assert tag_counts["Termchat"].get("d") == 1, tag_counts
                 tag_str = out(
-                    await session.call_tool(
-                        "read_note", {"vault": "Termchat", "path": "TagStr.md"}
-                    )
+                    await session.call_tool("read_note", {"vault": "Termchat", "path": "TagStr.md"})
                 )
                 assert tag_str["frontmatter"]["tags"] == ["d"], tag_str
                 tag_list = out(
@@ -287,9 +278,7 @@ async def main() -> int:
                     },
                 )
                 linker_before = out(
-                    await session.call_tool(
-                        "read_note", {"vault": "Termchat", "path": "Linker.md"}
-                    )
+                    await session.call_tool("read_note", {"vault": "Termchat", "path": "Linker.md"})
                 )
                 assert linker_before["backlinks"] == ["OldName.md"], linker_before
                 moved = out(
@@ -315,9 +304,7 @@ async def main() -> int:
                 )
                 assert new["links"] == ["Linker"], new
                 linker_after = out(
-                    await session.call_tool(
-                        "read_note", {"vault": "Termchat", "path": "Linker.md"}
-                    )
+                    await session.call_tool("read_note", {"vault": "Termchat", "path": "Linker.md"})
                 )
                 assert linker_after["backlinks"] == ["NewName.md"], linker_after
                 bad_src = await session.call_tool(
@@ -339,6 +326,86 @@ async def main() -> int:
                 )
                 assert bad_dst.isError, "existing destination not rejected"
                 print("MCP operations OK")
+
+                # H: git versioning (history + restore)
+                v1 = out(
+                    await session.call_tool(
+                        "write_note",
+                        {"vault": "Termchat", "path": "Vcs.md", "content": "v1\n"},
+                    )
+                )
+                assert v1["versioning"] == "ok", v1
+                assert (vaults / "Termchat" / ".git").is_dir(), "vault repo not initialized"
+                hist = out(
+                    await session.call_tool("history", {"vault": "Termchat", "path": "Vcs.md"})
+                )
+                assert hist["untracked"] is False, hist
+                assert len(hist["history"]) == 1, hist
+                assert "write" in hist["history"][0]["message"], hist
+                assert len(hist["history"][0]["sha"]) == 40, hist
+                await session.call_tool(
+                    "write_note",
+                    {"vault": "Termchat", "path": "Vcs.md", "content": "v2\n"},
+                )
+                hist2 = out(
+                    await session.call_tool("history", {"vault": "Termchat", "path": "Vcs.md"})
+                )
+                assert len(hist2["history"]) == 2, hist2
+                assert hist2["history"][0]["date"], hist2
+                fresh_hist = out(
+                    await session.call_tool(
+                        "history", {"vault": "Termchat", "path": "NeverWritten.md"}
+                    )
+                )
+                assert fresh_hist["history"] == [] and fresh_hist["untracked"] is True, fresh_hist
+                await session.call_tool("delete_note", {"vault": "Termchat", "path": "Vcs.md"})
+                assert not (vaults / "Termchat" / "Vcs.md").exists()
+                first_sha = hist2["history"][-1]["sha"]
+                restored = out(
+                    await session.call_tool(
+                        "restore",
+                        {"vault": "Termchat", "path": "Vcs.md", "rev": first_sha},
+                    )
+                )
+                assert (vaults / "Termchat" / "Vcs.md").read_text(encoding="utf-8") == "v1\n", (
+                    restored
+                )
+                assert restored["sha256"] == v1["sha256"], restored
+                bad_rev = await session.call_tool(
+                    "restore",
+                    {"vault": "Termchat", "path": "Vcs.md", "rev": "deadbeef" * 5},
+                )
+                assert bad_rev.isError, "bogus rev was not rejected"
+                print("VCS operations OK")
+
+        # I: VAULTS_HUB_GIT=0 disables versioning (separate server process)
+        params_off = StdioServerParameters(
+            command=sys.executable,
+            args=[str(SERVER)],
+            env={
+                "VAULTS_ROOT": str(vaults),
+                "VAULTS_HUB_GIT": "0",
+                "PYTHONUNBUFFERED": "1",
+            },
+        )
+        async with stdio_client(params_off) as (read, write):
+            async with ClientSession(read, write) as off:
+                await off.initialize()
+                w = out(
+                    await off.call_tool(
+                        "write_note",
+                        {"vault": "Runnix", "path": "Off.md", "content": "x\n"},
+                    )
+                )
+                assert w["versioning"] == "disabled", w
+                assert (vaults / "Runnix" / "Off.md").is_file()
+                h = await off.call_tool("history", {"vault": "Runnix", "path": "notes.md"})
+                assert h.isError, "history with VAULTS_HUB_GIT=0 must error"
+                r = await off.call_tool(
+                    "restore", {"vault": "Runnix", "path": "notes.md", "rev": "HEAD"}
+                )
+                assert r.isError, "restore with VAULTS_HUB_GIT=0 must error"
+                print("VCS opt-out OK")
 
     print("SMOKE OK")
     return 0

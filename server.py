@@ -1,7 +1,7 @@
 """Vaults hub: local stdio MCP server exposing every project vault at once.
 
 Each project has its own Obsidian vault under VAULTS_ROOT (default
-~/Dev/vaults/<project>/). This server operates directly on the markdown files,
+~/.vaults/<project>/). This server operates directly on the markdown files,
 so opencode can read/write/search all vaults with no Obsidian windows, ports,
 or API keys involved. Spawned per-session by opencode over stdio.
 """
@@ -36,7 +36,7 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.message import SessionMessage
 
-VAULTS_ROOT = Path(os.environ.get("VAULTS_ROOT", str(Path.home() / "Dev" / "vaults"))).resolve()
+VAULTS_ROOT = Path(os.environ.get("VAULTS_ROOT", str(Path.home() / ".vaults"))).resolve()
 
 mcp = FastMCP("vaults")
 
@@ -232,6 +232,189 @@ def _atomic_write(path: Path, content: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+# ---------------------------------------------------------------------------
+# Per-vault git versioning. One repo per vault, local-only (never push/fetch).
+# ---------------------------------------------------------------------------
+
+# Per-invocation identity so we never touch the user's gitconfig.
+_GIT_IDENTITY = [
+    "-c",
+    "user.name=vaults-hub",
+    "-c",
+    "user.email=vaults-hub@localhost",
+    "-c",
+    "commit.gpgsign=false",
+]
+# Written to $GIT_DIR/info/exclude (never a visible .gitignore).
+_GIT_EXCLUDES = [".obsidian/", ".*.lock", ".*.tmp"]
+# vault name -> "ours" | "external" | "disabled" (process-local cache).
+_GIT_MODE: dict[str, str] = {}
+
+
+def _git_enabled() -> bool:
+    """Opt-out switch: VAULTS_HUB_GIT=0 disables all versioning."""
+    return os.environ.get("VAULTS_HUB_GIT", "1") != "0"
+
+
+def _git_run(root: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run git in the vault root with per-invocation identity. Never raises."""
+    try:
+        return subprocess.run(
+            ["git", *_GIT_IDENTITY, *args],
+            cwd=root,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(list(args), 127, b"", str(exc).encode())
+
+
+def _git_ensure_excludes(root: Path) -> None:
+    """Append our exclude patterns to $GIT_DIR/info/exclude if missing."""
+    exclude = root / ".git" / "info" / "exclude"
+    try:
+        text = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+    except OSError:
+        return
+    missing = [p for p in _GIT_EXCLUDES if p not in text.splitlines()]
+    if not missing:
+        return
+    try:
+        with exclude.open("a", encoding="utf-8") as f:
+            if text and not text.endswith("\n"):
+                f.write("\n")
+            f.write("".join(p + "\n" for p in missing))
+    except OSError:
+        pass
+
+
+def _git_mode(root: Path, vault: str) -> str:
+    """Return 'ours', 'external', or 'disabled', lazily initing one repo per vault.
+
+    Call on mutation paths while holding the note's fcntl lock. Only the
+    process-local cache touches _INDEX_LOCK; never held across git subprocesses.
+    """
+    if not _git_enabled() or shutil.which("git") is None:
+        return "disabled"
+    with _INDEX_LOCK:
+        cached = _GIT_MODE.get(vault)
+    if cached is not None:
+        return cached
+    mode = _git_detect(root)
+    with _INDEX_LOCK:
+        _GIT_MODE[vault] = mode
+    return mode
+
+
+def _git_detect(root: Path) -> str:
+    """Adopt a vault-root .git, defer to an outer repo, or lazily init ours."""
+    if (root / ".git").exists():
+        _git_ensure_excludes(root)
+        return "ours"
+    if _git_run(root, "rev-parse", "--git-dir").returncode == 0:
+        return "external"  # vault nested in someone else's repo: hands off.
+    init = _git_run(root, "init", "-b", "main")
+    if init.returncode != 0:  # pre-2.28 git has no -b; retry plainly.
+        init = _git_run(root, "init")
+    if init.returncode != 0:
+        _logger.warning(
+            "vaults git init failed for %s: %s",
+            root,
+            init.stderr.decode("utf-8", errors="replace")[:200],
+        )
+        return "disabled"
+    _git_ensure_excludes(root)
+    return "ours"
+
+
+def _git_commit(root: Path, rels: list[str], subject: str, sha_hex: str | None) -> str | None:
+    """Path-scoped `git add` + `git commit --only`. None on success, error on failure.
+
+    Skips the commit when there is nothing to commit. Fail-open by contract:
+    callers surface the error string; the file write always stands.
+    """
+    add = _git_run(root, "add", "--", *rels)
+    if add.returncode != 0:
+        return add.stderr.decode("utf-8", errors="replace").strip()[:300]
+    status = _git_run(root, "status", "--porcelain", "--", *rels)
+    if status.returncode != 0:
+        return status.stderr.decode("utf-8", errors="replace").strip()[:300] or "git status failed"
+    if not status.stdout.strip():
+        return None
+    msg = subject if sha_hex is None else f"{subject}\n\nSha256: {sha_hex}"
+    commit = _git_run(root, "commit", "--only", "-m", msg, "--", *rels)
+    if commit.returncode != 0:
+        err = (
+            commit.stderr.decode("utf-8", errors="replace")
+            + commit.stdout.decode("utf-8", errors="replace")
+        ).strip()
+        if "nothing to commit" in err:
+            return None
+        return err[:300] or "git commit failed"
+    return None
+
+
+def _git_result(root: Path, vault: str, rels: list[str], subject: str, sha_hex: str | None) -> dict:
+    """One versioning step for a mutation. Never raises (fail open)."""
+    try:
+        mode = _git_mode(root, vault)
+    except Exception as exc:
+        _logger.warning("vaults git versioning failed for %s: %s", vault, exc)
+        return {"versioning": "disabled", "commit_error": str(exc)[:200]}
+    if mode != "ours":
+        return {"versioning": mode}
+    err = _git_commit(root, rels, subject, sha_hex)
+    out: dict = {"versioning": "ok"}
+    if err:
+        out["commit_error"] = err
+    return out
+
+
+def _git_tracked(root: Path, rel: str) -> bool:
+    """True if rel is in the vault repo index. Call only when mode is 'ours'."""
+    return _git_run(root, "ls-files", "--error-unmatch", "--", rel).returncode == 0
+
+
+def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | None) -> str | None:
+    """Commit an untracked note before delete so restore can recover it.
+
+    Error string on failure, None when already tracked or versioning is off.
+    Never raises (fail open).
+    """
+    try:
+        if _git_mode(root, vault) != "ours" or _git_tracked(root, rel):
+            return None
+        return _git_commit(root, [rel], f"vaults: track before delete {rel}", sha_hex)
+    except Exception as exc:
+        _logger.warning("vaults pre-delete track failed for %s: %s", rel, exc)
+        return str(exc)[:200]
+
+
+def _git_read_mode(root: Path, vault: str) -> str:
+    """Read-only mode probe for history: never inits a repo ('none' if absent)."""
+    if not _git_enabled():
+        return "disabled"
+    if shutil.which("git") is None:
+        return "missing"
+    with _INDEX_LOCK:
+        cached = _GIT_MODE.get(vault)
+    if cached is not None:
+        return cached
+    if (root / ".git").exists():
+        return "ours"
+    if _git_run(root, "rev-parse", "--git-dir").returncode == 0:
+        return "external"
+    return "none"
+
+
+def _git_mode_error(mode: str) -> str:
+    if mode == "disabled":
+        return "versioning is disabled (VAULTS_HUB_GIT=0); re-run with it unset to enable"
+    if mode == "missing":
+        return "git binary not found on PATH; install git to use history/restore"
+    return "vault lives inside an external git repo; versioning is hands-off"
 
 
 def _normalize_tags(value) -> list[str]:
@@ -536,7 +719,9 @@ def read_note(vault: str, path: str) -> dict:
     }
 
 
-def _write_note_locked(root: Path, p: Path, content: str, expected_sha256: str | None) -> dict:
+def _write_note_locked(
+    root: Path, p: Path, content: str, expected_sha256: str | None, op: str = "write"
+) -> dict:
     """Write under an acquired lock. Callers must hold _note_lock(p)."""
     if p.suffix != ".md":
         raise ValueError("note path must end in .md")
@@ -552,14 +737,18 @@ def _write_note_locked(root: Path, p: Path, content: str, expected_sha256: str |
         )
     content, refreshed = _refresh_updated(content)
     _atomic_write(p, content)
+    rel = _rel(root, p)
+    new_sha = _sha256(content)
+    versioning = _git_result(root, root.name, [rel], f"vaults: {op} {rel}", new_sha)
     _invalidate_vault(root.name)
     return {
         "vault": root.name,
-        "path": _rel(root, p),
+        "path": rel,
         "bytes": len(content.encode()),
         "previous_sha256": previous_sha256,
-        "sha256": _sha256(content),
+        "sha256": new_sha,
         "updated_refreshed": refreshed,
+        **versioning,
     }
 
 
@@ -596,7 +785,7 @@ def append_note(vault: str, path: str, text: str, expected_sha256: str | None = 
         current = _read_text(p) if p.is_file() else ""
         if current and not current.endswith("\n"):
             current += "\n"
-        return _write_note_locked(root, p, current + text, expected_sha256)
+        return _write_note_locked(root, p, current + text, expected_sha256, op="append")
 
 
 @mcp.tool(
@@ -620,6 +809,8 @@ def delete_note(vault: str, path: str, missing_ok: bool = False) -> dict:
             sha_before = _sha256(_read_text(p))
         except OSError:
             sha_before = None
+        rel = _rel(root, p)
+        track_err = _git_track_before_delete(root, vault, rel, sha_before)
         try:
             p.unlink()
         except FileNotFoundError:
@@ -631,11 +822,14 @@ def delete_note(vault: str, path: str, missing_ok: bool = False) -> dict:
                 tmp.unlink()
             except OSError:
                 pass
+        versioning = _git_result(root, vault, [rel], f"vaults: delete {rel}", sha_before)
+        if track_err and "commit_error" not in versioning:
+            versioning["commit_error"] = track_err
         _invalidate_vault(vault)
     # NOTE: lock files are intentionally left in place. Unlinking the sibling
     # lock after unlock races with a concurrent process that just opened (or
     # is about to flock) the same path, breaking mutual exclusion.
-    return {"vault": vault, "path": path, "sha256_before": sha_before}
+    return {"vault": vault, "path": path, "sha256_before": sha_before, **versioning}
 
 
 @mcp.tool(
@@ -684,13 +878,119 @@ def move_note(
                 tmp.unlink()
             except OSError:
                 pass
+        src_rel = _rel(root, src)
+        dst_rel = _rel(root, dst)
+        new_sha = _sha256(content)
+        versioning = _git_result(
+            root, vault, [dst_rel, src_rel], f"vaults: move {src_rel} -> {dst_rel}", new_sha
+        )
         _invalidate_vault(vault)
         _ensure_indexes(root, vault)
         return {
             "vault": vault,
             "src_path": src_path,
-            "dst_path": _rel(root, dst),
-            "sha256": _sha256(content),
+            "dst_path": dst_rel,
+            "sha256": new_sha,
+            **versioning,
+        }
+
+
+@mcp.tool(
+    description=(
+        "Show version history for a note (or the whole vault) from the local "
+        "git repo: [{sha, date, message}]. An untracked path returns an empty "
+        "list with untracked:true."
+    )
+)
+@_logged
+def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
+    limit = max(1, min(200, int(limit)))
+    root = _vault_root(vault)
+    if path is not None:
+        _note_path(root, path)  # validate: stays inside the vault
+    mode = _git_read_mode(root, vault)
+    if mode in ("disabled", "missing", "external"):
+        raise ValueError(_git_mode_error(mode))
+    if path is not None and (mode == "none" or not _git_tracked(root, path)):
+        return {"vault": vault, "path": path, "limit": limit, "history": [], "untracked": True}
+    args = ["log", "--no-decorate", f"--max-count={limit}", "--pretty=format:%H%x00%aI%x00%s"]
+    if path is not None:
+        args += ["--follow", "--", path]
+    proc = _git_run(root, *args)
+    if proc.returncode != 0:
+        raise ValueError(
+            "git log failed: " + proc.stderr.decode("utf-8", errors="replace").strip()[:200]
+        )
+    entries = []
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        parts = line.split("\x00")
+        if len(parts) != 3 or not parts[0]:
+            continue
+        entries.append({"sha": parts[0], "date": parts[1], "message": parts[2]})
+    out: dict = {"vault": vault, "path": path, "limit": limit, "history": entries}
+    if path is not None:
+        out["untracked"] = False
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Restore a note's content from a past revision (git rev, e.g. a history "
+        "sha). Snapshots dirty worktree state first; recreates deleted notes. "
+        "Honors expected_sha256 against current content."
+    )
+)
+@_logged
+def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None) -> dict:
+    root = _vault_root(vault)
+    p = _note_path(root, path)
+    if p.suffix != ".md":
+        raise ValueError("note path must end in .md")
+    if not rev or not rev.strip():
+        raise ValueError("rev must be a non-empty git revision")
+    rev = rev.strip()
+    with _note_lock(p):
+        try:
+            mode = _git_mode(root, vault)
+        except Exception as exc:
+            raise ValueError(f"versioning unavailable: {exc}") from exc
+        if mode != "ours":
+            raise ValueError(_git_mode_error(mode))
+        rel = _rel(root, p)
+        try:
+            current = p.read_bytes() if p.is_file() else None
+        except OSError as exc:
+            raise ValueError(f"note not found: {path!r}") from exc
+        current_sha = hashlib.sha256(current).hexdigest() if current is not None else None
+        if expected_sha256 is not None and expected_sha256 != current_sha:
+            raise ValueError(
+                "note has changed since the supplied expected_sha256; read it again before restoring"
+            )
+        status = _git_run(root, "status", "--porcelain", "--", rel)
+        if status.returncode == 0 and status.stdout.strip():
+            snap_err = _git_commit(root, [rel], "vaults: snapshot before restore", current_sha)
+            if snap_err:
+                _logger.warning("vaults pre-restore snapshot failed for %s: %s", rel, snap_err)
+        show = _git_run(root, "show", f"{rev}:{rel}")
+        if show.returncode != 0:
+            raise ValueError(f"unknown revision or path not in revision: {rev!r} for {path!r}")
+        data = show.stdout
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.write_bytes(data)
+        except OSError as exc:
+            raise ValueError(f"cannot restore {path!r}: {exc}") from exc
+        new_sha = hashlib.sha256(data).hexdigest()
+        versioning = _git_result(root, vault, [rel], f"vaults: restore {rel} from {rev}", new_sha)
+        _invalidate_vault(vault)
+        return {
+            "vault": vault,
+            "path": rel,
+            "rev": rev,
+            "bytes": len(data),
+            "previous_sha256": current_sha,
+            "sha256": new_sha,
+            **versioning,
         }
 
 
@@ -974,21 +1274,21 @@ def _parse_args(argv=None):
         "--vaults-root",
         default=None,
         help="Root dir holding one subdir per vault. Overrides VAULTS_ROOT env; "
-        "defaults to ~/Dev/vaults. Must already exist.",
+        "defaults to ~/.vaults. Created on startup if missing.",
     )
     return parser.parse_args(argv)
 
 
 def _resolve_vaults_root(cli_value: str | None) -> Path:
-    """Resolve the vaults root without silently creating anything."""
-    raw = cli_value or os.environ.get("VAULTS_ROOT") or str(Path.home() / "Dev" / "vaults")
+    """Resolve the vaults root, creating it on startup when missing."""
+    raw = cli_value or os.environ.get("VAULTS_ROOT") or str(Path.home() / ".vaults")
     root = Path(raw).expanduser().resolve()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"error: cannot create vaults root {root}: {exc}") from exc
     if not root.is_dir():
-        raise SystemExit(
-            f"error: vaults root does not exist: {root}\n"
-            f"Create it with: mkdir -p {root}\n"
-            "Or point --vaults-root / VAULTS_ROOT at an existing directory."
-        )
+        raise SystemExit(f"error: vaults root is not a directory: {root}")
     return root
 
 
