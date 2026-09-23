@@ -6,9 +6,14 @@ so opencode can read/write/search all vaults with no Obsidian windows, ports,
 or API keys involved. Spawned per-session by opencode over stdio.
 """
 
+import argparse
 import asyncio
 import contextlib
-import fcntl
+
+try:
+    import fcntl  # POSIX-only; flock-based note locks have no Windows equivalent.
+except ImportError as exc:
+    raise RuntimeError("vaults-hub requires POSIX fcntl (unavailable on Windows)") from exc
 import fnmatch
 import functools
 import json
@@ -31,9 +36,7 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.message import SessionMessage
 
-VAULTS_ROOT = Path(
-    os.environ.get("VAULTS_ROOT", str(Path.home() / "Dev" / "vaults"))
-).resolve()
+VAULTS_ROOT = Path(os.environ.get("VAULTS_ROOT", str(Path.home() / "Dev" / "vaults"))).resolve()
 
 mcp = FastMCP("vaults")
 
@@ -53,12 +56,8 @@ def _setup_logging() -> None:
     try:
         log_dir = Path.home() / ".cache" / "vaults-hub"
         log_dir.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            log_dir / "debug.log", maxBytes=1_000_000, backupCount=3
-        )
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-        )
+        handler = RotatingFileHandler(log_dir / "debug.log", maxBytes=1_000_000, backupCount=3)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
         _logger.addHandler(handler)
         _logger.setLevel(logging.DEBUG)
     except OSError:
@@ -100,6 +99,11 @@ _INDEX_MTIMES: dict[str, dict[str, float]] = {}
 # vault name -> cached sorted note list (lane A: rebuild on missing/invalidate)
 _NOTES_CACHE: dict[str, list[Path]] = {}
 
+# Single process-wide lock serializing access to the process-local indexes
+# above (_NOTES_CACHE / _BACKLINK_INDEX / _FRONTMATTER_INDEX / _INDEX_MTIMES).
+# RLock (not Lock) because _ensure_indexes calls _rebuild_indexes while held.
+_INDEX_LOCK = threading.RLock()
+
 
 def _scan_notes(root: Path) -> list[Path]:
     """Uncached recursive scan, skipping `.obsidian` trees."""
@@ -108,10 +112,11 @@ def _scan_notes(root: Path) -> list[Path]:
 
 def _invalidate_vault(vault: str) -> None:
     """Drop all cached indexes for a vault. Called by every writer."""
-    _INDEX_MTIMES.pop(vault, None)
-    _BACKLINK_INDEX.pop(vault, None)
-    _FRONTMATTER_INDEX.pop(vault, None)
-    _NOTES_CACHE.pop(vault, None)
+    with _INDEX_LOCK:
+        _INDEX_MTIMES.pop(vault, None)
+        _BACKLINK_INDEX.pop(vault, None)
+        _FRONTMATTER_INDEX.pop(vault, None)
+        _NOTES_CACHE.pop(vault, None)
 
 
 def _vault_root(vault: str) -> Path:
@@ -129,15 +134,17 @@ def _all_notes(root: Path) -> list[Path]:
     Returns a copy so callers cannot mutate the cache.
     """
     vault = root.name
-    cached = _NOTES_CACHE.get(vault)
-    if cached is not None:
-        try:
-            if all(p.is_file() for p in cached):
-                return list(cached)
-        except OSError:
-            pass
+    with _INDEX_LOCK:
+        cached = _NOTES_CACHE.get(vault)
+        if cached is not None:
+            try:
+                if all(p.is_file() for p in cached):
+                    return list(cached)
+            except OSError:
+                pass
     fresh = _scan_notes(root)
-    _NOTES_CACHE[vault] = list(fresh)
+    with _INDEX_LOCK:
+        _NOTES_CACHE[vault] = list(fresh)
     return list(fresh)
 
 
@@ -267,9 +274,7 @@ def _normalize_frontmatter(data: dict) -> dict:
         if isinstance(val, (datetime, date)):
             out[key] = val.isoformat()
         elif isinstance(val, list):
-            out[key] = [
-                v.isoformat() if isinstance(v, (datetime, date)) else v for v in val
-            ]
+            out[key] = [v.isoformat() if isinstance(v, (datetime, date)) else v for v in val]
     return out
 
 
@@ -292,15 +297,11 @@ def _refresh_updated(text: str) -> tuple[str, bool]:
     m = FRONTMATTER_RE.match(text)
     if not m or "updated:" not in m.group(1):
         return text, False
-    new_block = UPDATED_RE.sub(
-        f"updated: {date.today().isoformat()}", m.group(1), count=1
-    )
+    new_block = UPDATED_RE.sub(f"updated: {date.today().isoformat()}", m.group(1), count=1)
     return text[: m.start(1)] + new_block + text[m.end(1) :], True
 
 
-def _resolve_link_fast(
-    root: Path, target: str, by_stem: dict[str, Path]
-) -> Path | None:
+def _resolve_link_fast(root: Path, target: str, by_stem: dict[str, Path]) -> Path | None:
     """Resolve a wiki-link target using a prebuilt stem index."""
     target = target.strip()
     if not target:
@@ -316,51 +317,52 @@ def _resolve_link_fast(
 
 def _rebuild_indexes(root: Path, vault: str, scan: list[Path]) -> None:
     """Full rebuild of backlink + frontmatter indexes from one scan."""
-    by_stem: dict[str, Path] = {}
-    for p in sorted(scan, key=lambda q: (len(q.parts), q.as_posix())):
-        by_stem.setdefault(p.stem, p)
-    mtimes: dict[str, float] = {}
-    fm_index: dict[str, dict] = {}
-    targets_map: dict[str, set[Path]] = {}
-    for p in scan:
-        try:
-            rel = _rel(root, p)
-        except ValueError:
-            continue
-        try:
-            mtimes[rel] = p.stat().st_mtime
-        except OSError:
-            continue
-        try:
-            text = _read_text(p)
-        except OSError:
-            fm_index[rel] = {}
-            targets_map[rel] = set()
-            continue
-        try:
-            raw, _ = _split_frontmatter(text)
-            fm_index[rel] = raw
-        except Exception:
-            fm_index[rel] = {}
-        hits: set[Path] = set()
-        for t in WIKI_LINK_RE.findall(text):
-            hit = _resolve_link_fast(root, t.strip(), by_stem)
-            if hit is not None:
-                hits.add(hit)
-        targets_map[rel] = hits
-    backlinks: dict[str, set[str]] = {rel: set() for rel in mtimes}
-    for src_rel, tgts in targets_map.items():
-        for tgt in tgts:
+    with _INDEX_LOCK:
+        by_stem: dict[str, Path] = {}
+        for p in sorted(scan, key=lambda q: (len(q.parts), q.as_posix())):
+            by_stem.setdefault(p.stem, p)
+        mtimes: dict[str, float] = {}
+        fm_index: dict[str, dict] = {}
+        targets_map: dict[str, set[Path]] = {}
+        for p in scan:
             try:
-                tgt_rel = _rel(root, tgt)
+                rel = _rel(root, p)
             except ValueError:
                 continue
-            if tgt_rel in backlinks and tgt_rel != src_rel:
-                backlinks[tgt_rel].add(src_rel)
-    _BACKLINK_INDEX[vault] = backlinks
-    _FRONTMATTER_INDEX[vault] = fm_index
-    _INDEX_MTIMES[vault] = mtimes
-    _NOTES_CACHE[vault] = list(scan)
+            try:
+                mtimes[rel] = p.stat().st_mtime
+            except OSError:
+                continue
+            try:
+                text = _read_text(p)
+            except OSError:
+                fm_index[rel] = {}
+                targets_map[rel] = set()
+                continue
+            try:
+                raw, _ = _split_frontmatter(text)
+                fm_index[rel] = raw
+            except Exception:
+                fm_index[rel] = {}
+            hits: set[Path] = set()
+            for t in WIKI_LINK_RE.findall(text):
+                hit = _resolve_link_fast(root, t.strip(), by_stem)
+                if hit is not None:
+                    hits.add(hit)
+            targets_map[rel] = hits
+        backlinks: dict[str, set[str]] = {rel: set() for rel in mtimes}
+        for src_rel, tgts in targets_map.items():
+            for tgt in tgts:
+                try:
+                    tgt_rel = _rel(root, tgt)
+                except ValueError:
+                    continue
+                if tgt_rel in backlinks and tgt_rel != src_rel:
+                    backlinks[tgt_rel].add(src_rel)
+        _BACKLINK_INDEX[vault] = backlinks
+        _FRONTMATTER_INDEX[vault] = fm_index
+        _INDEX_MTIMES[vault] = mtimes
+        _NOTES_CACHE[vault] = list(scan)
 
 
 def _ensure_indexes(root: Path, vault: str) -> None:
@@ -371,29 +373,30 @@ def _ensure_indexes(root: Path, vault: str) -> None:
     cached backlink sets.
     """
     scan = _scan_notes(root)
-    mt = _INDEX_MTIMES.get(vault)
-    cached_bl = _BACKLINK_INDEX.get(vault)
-    cached_fm = _FRONTMATTER_INDEX.get(vault)
-    if mt is not None and cached_bl is not None and cached_fm is not None:
-        try:
-            scan_rels = {_rel(root, p) for p in scan}
-        except ValueError:
-            scan_rels = set()
-        if set(mt.keys()) == scan_rels:
-            valid = True
-            for p in scan:
-                try:
-                    rel = _rel(root, p)
-                    cur = p.stat().st_mtime
-                except (OSError, ValueError):
-                    valid = False
-                    break
-                if mt.get(rel) != cur:
-                    valid = False
-                    break
-            if valid:
-                _NOTES_CACHE[vault] = list(scan)
-                return
+    with _INDEX_LOCK:
+        mt = _INDEX_MTIMES.get(vault)
+        cached_bl = _BACKLINK_INDEX.get(vault)
+        cached_fm = _FRONTMATTER_INDEX.get(vault)
+        if mt is not None and cached_bl is not None and cached_fm is not None:
+            try:
+                scan_rels = {_rel(root, p) for p in scan}
+            except ValueError:
+                scan_rels = set()
+            if set(mt.keys()) == scan_rels:
+                valid = True
+                for p in scan:
+                    try:
+                        rel = _rel(root, p)
+                        cur = p.stat().st_mtime
+                    except (OSError, ValueError):
+                        valid = False
+                        break
+                    if mt.get(rel) != cur:
+                        valid = False
+                        break
+                if valid:
+                    _NOTES_CACHE[vault] = list(scan)
+                    return
     _rebuild_indexes(root, vault, scan)
 
 
@@ -414,9 +417,7 @@ def _resolve_link(root: Path, target: str) -> Path | None:
     return sorted(matches, key=lambda p: (len(p.parts), p.as_posix()))[0]
 
 
-def _link_info(
-    root: Path, here: Path, text: str
-) -> tuple[list[str], list[str], list[str]]:
+def _link_info(root: Path, here: Path, text: str) -> tuple[list[str], list[str], list[str]]:
     targets = [t.strip() for t in WIKI_LINK_RE.findall(text) if t.strip()]
     links, unresolved = [], []
     for t in targets:
@@ -501,9 +502,7 @@ def list_notes(vault: str, path: str = "", recursive: bool = False) -> dict:
     return {"vault": vault, "path": path, "dirs": dirs, "notes": notes}
 
 
-@mcp.tool(
-    description="Read a note: frontmatter, content, wiki-links, backlinks, unresolved links."
-)
+@mcp.tool(description="Read a note: frontmatter, content, wiki-links, backlinks, unresolved links.")
 @_logged
 def read_note(vault: str, path: str) -> dict:
     root = _vault_root(vault)
@@ -537,9 +536,7 @@ def read_note(vault: str, path: str) -> dict:
     }
 
 
-def _write_note_locked(
-    root: Path, p: Path, content: str, expected_sha256: str | None
-) -> dict:
+def _write_note_locked(root: Path, p: Path, content: str, expected_sha256: str | None) -> dict:
     """Write under an acquired lock. Callers must hold _note_lock(p)."""
     if p.suffix != ".md":
         raise ValueError("note path must end in .md")
@@ -574,9 +571,7 @@ def _write_note_locked(
     )
 )
 @_logged
-def write_note(
-    vault: str, path: str, content: str, expected_sha256: str | None = None
-) -> dict:
+def write_note(vault: str, path: str, content: str, expected_sha256: str | None = None) -> dict:
     root = _vault_root(vault)
     p = _note_path(root, path)
     with _note_lock(p):
@@ -591,9 +586,7 @@ def write_note(
     )
 )
 @_logged
-def append_note(
-    vault: str, path: str, text: str, expected_sha256: str | None = None
-) -> dict:
+def append_note(vault: str, path: str, text: str, expected_sha256: str | None = None) -> dict:
     root = _vault_root(vault)
     p = _note_path(root, path)
     if p.suffix != ".md":
@@ -639,11 +632,9 @@ def delete_note(vault: str, path: str, missing_ok: bool = False) -> dict:
             except OSError:
                 pass
         _invalidate_vault(vault)
-    lock_sibling = p.parent / f".{p.name}.lock"
-    try:
-        lock_sibling.unlink()
-    except OSError:
-        pass
+    # NOTE: lock files are intentionally left in place. Unlinking the sibling
+    # lock after unlock races with a concurrent process that just opened (or
+    # is about to flock) the same path, breaking mutual exclusion.
     return {"vault": vault, "path": path, "sha256_before": sha_before}
 
 
@@ -791,6 +782,7 @@ def search_notes(
 ) -> dict:
     before = max(0, min(10, int(before)))
     after = max(0, min(10, int(after)))
+    limit = max(1, min(200, int(limit)))
     roots = [_vault_root(vault)] if vault else [Path(v["path"]) for v in list_vaults()]
     hits = _collect_hits(roots, query, regex, case_sensitive, limit)
     _attach_context(hits, roots, before, after)
@@ -814,9 +806,7 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
     hits: list[dict] = []
     for root in roots:
         try:
-            proc = subprocess.run(
-                args + [str(root)], capture_output=True, text=True, timeout=30
-            )
+            proc = subprocess.run(args + [str(root)], capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired):
             continue
         for line in proc.stdout.splitlines():
@@ -827,13 +817,20 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
             if ev.get("type") != "match":
                 continue
             d = ev["data"]
-            abspath = Path(d["path"]["text"]).resolve()
+            try:
+                abspath = Path(d["path"]["text"]).resolve()
+                rel = abspath.relative_to(root).as_posix()
+                text = d["lines"]["text"].strip()
+            except (KeyError, ValueError, OSError, AttributeError, TypeError):
+                # Non-UTF-8 paths arrive as {"bytes": "<base64>"} with no
+                # "text" key; skip rather than crash the tool.
+                continue
             hits.append(
                 {
                     "vault": root.name,
-                    "path": abspath.relative_to(root).as_posix(),
+                    "path": rel,
                     "line": d["line_number"],
-                    "text": d["lines"]["text"].strip(),
+                    "text": text,
                 }
             )
             if len(hits) >= limit:
@@ -908,19 +905,14 @@ async def _serve_stdio() -> None:
     reads through a standard-library thread while leaving MCP protocol handling
     to the SDK.
     """
-    read_sender, read_stream = anyio.create_memory_object_stream[
-        SessionMessage | Exception
-    ](32)
+    read_sender, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](32)
     write_sender, write_stream = anyio.create_memory_object_stream[SessionMessage](32)
 
     async def write_stdout() -> None:
         async with write_stream:
             async for session_message in write_stream:
                 payload = (
-                    session_message.message.model_dump_json(
-                        by_alias=True, exclude_none=True
-                    )
-                    + "\n"
+                    session_message.message.model_dump_json(by_alias=True, exclude_none=True) + "\n"
                 )
                 _write_stdout(payload)
 
@@ -928,6 +920,11 @@ async def _serve_stdio() -> None:
         _start_stdin_bridge(asyncio.get_running_loop(), read_sender)
         task_group.start_soon(write_stdout)
         try:
+            # Pinned to mcp==1.30.0 (see requirements.txt): this uses the
+            # private mcp._mcp_server protocol server plus the custom stdin
+            # bridge above, because this runtime's AnyIO build hangs iterating
+            # a wrapped stdin file. Keep the pin; upgrading the SDK may change
+            # or remove this private API.
             await mcp._mcp_server.run(  # noqa: SLF001 - FastMCP's protocol server
                 read_stream,
                 write_sender,
@@ -968,5 +965,33 @@ def _start_stdin_bridge(
     threading.Thread(target=forward, name="mcp-stdin", daemon=True).start()
 
 
+def _parse_args(argv=None):
+    """CLI args parsed in __main__ only; precedence: flag > env > default."""
+    parser = argparse.ArgumentParser(
+        description="Serve Obsidian-style Markdown vaults over stdio (MCP)."
+    )
+    parser.add_argument(
+        "--vaults-root",
+        default=None,
+        help="Root dir holding one subdir per vault. Overrides VAULTS_ROOT env; "
+        "defaults to ~/Dev/vaults. Must already exist.",
+    )
+    return parser.parse_args(argv)
+
+
+def _resolve_vaults_root(cli_value: str | None) -> Path:
+    """Resolve the vaults root without silently creating anything."""
+    raw = cli_value or os.environ.get("VAULTS_ROOT") or str(Path.home() / "Dev" / "vaults")
+    root = Path(raw).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(
+            f"error: vaults root does not exist: {root}\n"
+            f"Create it with: mkdir -p {root}\n"
+            "Or point --vaults-root / VAULTS_ROOT at an existing directory."
+        )
+    return root
+
+
 if __name__ == "__main__":
+    VAULTS_ROOT = _resolve_vaults_root(_parse_args().vaults_root)
     anyio.run(_serve_stdio)
