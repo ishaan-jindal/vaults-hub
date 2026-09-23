@@ -1,7 +1,7 @@
 [project]
 name = "vaults-hub"
 version = "0.1.0"
-description = "Single-file stdio MCP server for Obsidian-style Markdown vaults"
+description = "Stdio MCP server for Obsidian-style Markdown vaults"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

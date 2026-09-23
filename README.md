@@ -1,6 +1,6 @@
 # vaults-hub
 
-A single-file Python [MCP](https://modelcontextprotocol.io) server that exposes your
+A Python [MCP](https://modelcontextprotocol.io) server that exposes your
 [Obsidian](https://obsidian.md)-style Markdown vaults to MCP clients (e.g. OpenCode).
 
 Keep each project's docs as plain Markdown on disk, and let an agent
@@ -71,7 +71,7 @@ With the server registered as `vaults`:
 
 ## Tools
 
-11 tools (see `server.py` for exact descriptions):
+11 tools (see `vaults/server.py` for exact descriptions):
 
 | Tool | What it does |
 | ---- | ------------ |
@@ -143,14 +143,17 @@ versioning and its opt-out), and exits non-zero with a traceback on failure.
 ## Architecture (brief)
 
 ```
-opencode (MCP client, stdio) <-> server.py (FastMCP "vaults", 11 tools) <-> ~/.vaults/<project>/*.md
+opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 11 tools) <-> ~/.vaults/<project>/*.md
 ```
 
-- `server.py` is the whole server: path validation, UTF-8 checks, `fcntl`
-  shared/exclusive locks, atomic writes (temp file + `os.replace`), SHA-256
-  optimistic concurrency, in-memory backlink/frontmatter indexes keyed by
-  vault with mtime-based invalidation, link/tag/search helpers, and the
-  per-vault git versioning layer.
+- `vaults/` is the whole server: `config.py` (vaults root, logging, CLI),
+  `notes.py` (path validation, UTF-8 checks, `fcntl` locks, atomic writes,
+  SHA-256 optimistic concurrency, frontmatter/wiki-link helpers, note CRUD),
+  `indexes.py` (in-memory backlink/frontmatter indexes with mtime-based
+  invalidation), `search.py` (ripgrep + Python-fallback search),
+  `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 11
+  tools, stdio bridge). Root `server.py` is a thin shim so `python
+  server.py` keeps working.
 - `smoke_test.py` spawns `server.py` over stdio with `VAULTS_ROOT` pointed at a temp dir.
 
 ## Limitations
