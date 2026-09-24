@@ -55,6 +55,7 @@ async def main() -> int:
                 tools = sorted(tool.name for tool in (await session.list_tools()).tools)
                 assert tools == [
                     "append_note",
+                    "create_vault",
                     "delete_note",
                     "history",
                     "list_notes",
@@ -72,6 +73,16 @@ async def main() -> int:
                     "Runnix": 1,
                     "Termchat": 3,
                 }
+
+                made = out(await session.call_tool("create_vault", {"vault": "Newvault"}))
+                assert made["created"] is True, made
+                assert (vaults / "Newvault").is_dir()
+                again = out(await session.call_tool("create_vault", {"vault": "Newvault"}))
+                assert again["created"] is False, again
+                bad_name = await session.call_tool("create_vault", {"vault": "../evil"})
+                assert bad_name.isError, "vault traversal was not rejected"
+                relisted = out(await session.call_tool("list_vaults", {}))
+                assert "Newvault" in {item["name"] for item in relisted}, relisted
 
                 home = out(
                     await session.call_tool(

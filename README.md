@@ -71,11 +71,12 @@ With the server registered as `vaults`:
 
 ## Tools
 
-11 tools (see `vaults/server.py` for exact descriptions):
+12 tools (see `vaults/server.py` for exact descriptions):
 
 | Tool | What it does |
 | ---- | ------------ |
 | `list_vaults` | List all project vaults with note counts |
+| `create_vault` | Create a new vault (`created=False` when it already exists) |
 | `list_notes` | List dirs/notes under a vault path (`recursive=True` for flat listing) |
 | `read_note` | Read a note: frontmatter, content, wiki-links, backlinks, unresolved links |
 | `write_note` | Create or atomically overwrite a note (`expected_sha256` for optimistic concurrency) |
@@ -143,15 +144,16 @@ versioning and its opt-out), and exits non-zero with a traceback on failure.
 ## Architecture (brief)
 
 ```
-opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 11 tools) <-> ~/.vaults/<project>/*.md
+opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 12 tools) <-> ~/.vaults/<project>/*.md
 ```
 
 - `vaults/` is the whole server: `config.py` (vaults root, logging, CLI),
   `notes.py` (path validation, UTF-8 checks, `fcntl` locks, atomic writes,
-  SHA-256 optimistic concurrency, frontmatter/wiki-link helpers, note CRUD),
+  SHA-256 optimistic concurrency, frontmatter/wiki-link helpers, note CRUD,
+  vault creation),
   `indexes.py` (in-memory backlink/frontmatter indexes with mtime-based
   invalidation), `search.py` (ripgrep + Python-fallback search),
-  `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 11
+  `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 12
   tools, stdio bridge). Root `server.py` is a thin shim so `python
   server.py` keeps working.
 - `smoke_test.py` spawns `server.py` over stdio with `VAULTS_ROOT` pointed at a temp dir.

@@ -274,6 +274,28 @@ def list_vaults() -> list[dict]:
     ]
 
 
+def create_vault(vault: str) -> dict:
+    """Create a vault dir. Idempotent: existing vault returns created=False."""
+    from vaults.indexes import _invalidate_vault  # deferred: avoids notes<->indexes cycle
+
+    name = (vault or "").strip()
+    if not name or name in (".", "..") or "/" in name or "\\" in name or ".." in name:
+        raise ValueError(f"invalid vault name: {vault!r}")
+    if Path(name).is_absolute():
+        raise ValueError(f"invalid vault name: {vault!r}")
+    root = (config.VAULTS_ROOT / name).resolve()
+    if root.parent != config.VAULTS_ROOT:
+        raise ValueError(f"invalid vault name: {vault!r}")
+    if root.is_dir():
+        return {"vault": name, "path": str(root), "created": False}
+    if root.exists():
+        raise ValueError(f"invalid vault name: {vault!r}")
+    root.mkdir(parents=True, exist_ok=True)
+    _invalidate_vault(name)
+    # NOTE: no git init here; first write lazily inits via versioning._git_mode.
+    return {"vault": name, "path": str(root), "created": True}
+
+
 def list_notes(vault: str, path: str = "", recursive: bool = False) -> dict:
     root = _vault_root(vault)
     base = _note_path(root, path or ".")

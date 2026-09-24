@@ -26,6 +26,15 @@ def list_vaults() -> list[dict]:
 
 
 @mcp.tool(
+    description="Create a new vault (one subdirectory of the vaults root). "
+    "Idempotent: returns created=False when the vault already exists."
+)
+@_logged
+def create_vault(vault: str) -> dict:
+    return _notes.create_vault(vault)
+
+
+@mcp.tool(
     description="List directories and notes under a vault path (vault-root-relative, '' for root). Pass recursive=True to list all descendant notes flat (dirs=[])."
 )
 @_logged
