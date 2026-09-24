@@ -71,26 +71,59 @@ With the server registered as `vaults`:
 
 ## Tools
 
-12 tools (see `vaults/server.py` for exact descriptions):
+13 tools (see `vaults/server.py` for exact descriptions). Read-only tools are
+marked **R**, mutating tools **M** (every mutation honors `expected_sha256`
+for optimistic concurrency — read first, then pass the sha back):
 
-| Tool | What it does |
-| ---- | ------------ |
-| `list_vaults` | List all project vaults with note counts |
-| `create_vault` | Create a new vault (`created=False` when it already exists) |
-| `list_notes` | List dirs/notes under a vault path (`recursive=True` for flat listing) |
-| `read_note` | Read a note: frontmatter, content, wiki-links, backlinks, unresolved links |
-| `write_note` | Create or atomically overwrite a note (`expected_sha256` for optimistic concurrency) |
-| `append_note` | Append text to a note (created if missing), atomic write, optional `expected_sha256` |
-| `delete_note` | Delete a note (`missing_ok=True` to tolerate absence); cleans up sibling tmp files (lock files are left in place) |
-| `move_note` | Move/rename a note; errors if src missing or dst exists; honors `expected_sha256`; refreshes `updated:` |
-| `list_tags` | Tag counts per vault from cached frontmatter (one vault or all) |
-| `search_notes` | Full-text search via ripgrep (or Python fallback) across one vault or all, with before/after context lines |
-| `history` | Version history for a note (`[{sha, date, message}]`) or whole vault from the local git repo |
-| `restore` | Restore a note from a past revision (snapshots dirty state first; recreates deleted notes) |
+| Tool | R/M | What it does |
+| ---- | --- | ------------ |
+| `list_vaults` | R | List all project vaults with note counts |
+| `server_info` | R | Server version, Python/platform, git + ripgrep availability, `git_enabled`, vaults root, vault count |
+| `create_vault` | M | Create a new vault (`created=False` when it already exists; idempotent) |
+| `list_notes` | R | List dirs/notes under a vault path (`recursive=True` for flat listing); paginated with `offset`/`limit` (default 200, max 500) → `total`, `truncated`, `next_offset` |
+| `read_note` | R | Read a note: frontmatter, content, wiki-links, backlinks, unresolved links |
+| `write_note` | M | Create or atomically overwrite a note (`expected_sha256` for optimistic concurrency) |
+| `append_note` | M | Append text to a note (created if missing), atomic write, optional `expected_sha256` |
+| `delete_note` | M | Delete a note (`missing_ok=True` to tolerate absence); cleans up sibling tmp files (lock files are left in place) |
+| `move_note` | M | Move/rename a note (copy+delete, not atomic); errors if src missing or dst exists; honors `expected_sha256`; refreshes `updated:` |
+| `list_tags` | R | Tag counts per vault from cached frontmatter (one vault or all) |
+| `search_notes` | R | Full-text search via ripgrep (or Python fallback) across one vault or all, with before/after context lines; `limit` 1–200 with a `truncated` flag |
+| `history` | R | Version history for a note (`[{sha, date, message}]`) or whole vault from the local git repo, with a `truncated` flag |
+| `restore` | M | Restore a note from a past revision (snapshots dirty state first; recreates deleted notes); echoes the revision as `restored_from` |
 
 Also built in: YAML-frontmatter parsing with auto-refreshed `updated:` dates,
 file locking (`fcntl`), atomic writes via temp-file + rename, backlink/tag
 indexes with mtime invalidation, and optional debug logging to file.
+
+## Reliability
+
+How the server avoids losing or corrupting notes:
+
+- **Atomic writes.** Every note write goes to a temp file in the same
+  directory (`fsync`ed, then `os.replace`), with the parent directory
+  `fsync`ed afterwards — readers never see a half-written note. Existing
+  file permissions are preserved.
+- **Locking.** Mutations serialize per note (`flock` read-modify-write
+  cycles across processes) and git operations serialize per vault, with a
+  consistent lock order everywhere (note lock first, git lock inside it),
+  so concurrent writes and restores cannot deadlock. Read-only `history`
+  takes no locks and never blocks writers; truncation flags are computed
+  by the core library, not the tool boundary.
+- **Optimistic concurrency.** Every mutation (`write`/`append`/`move`/
+  `delete`/`restore`) accepts `expected_sha256`; a stale sha is rejected
+  instead of clobbering someone else's edit.
+- **Fail-open versioning.** The write itself is the source of truth — a
+  missing git binary or failed commit warns (surfaced as `commit_error`)
+  but never blocks the write.
+- **Search parity.** `search_notes` prefers `rg --json` and falls back to
+  pure Python when ripgrep is absent; both sides skip dotfiles and
+  `.obsidian/` so hidden files never leak into results.
+- **No surprise frontmatter.** Notes without a frontmatter block stay that
+  way; `updated:` is only refreshed (or inserted) when a block exists.
+- **Fresh indexes.** Backlink/tag indexes are invalidated by mtime, so
+  external edits are picked up on the next read.
+- **Symlink confinement.** Symlink targets resolving outside the vault are
+  rejected — a link can never pull reads or writes out of the vault.
 
 ## Configuration
 
@@ -124,9 +157,11 @@ Each vault is a local git repo (one per vault root), maintained automatically:
 - **Opt-out.** Set `VAULTS_HUB_GIT=0` to disable init/commits; `history` and
   `restore` then return clear errors.
 - **`history(vault, path?, limit?)`** lists `[{sha, date, message}]` (newest
-  first, limit clamped 1–200); an untracked path returns `[]` with
+  first, limit clamped 1–200) plus a `truncated` flag when more commits exist
+  beyond the page; an untracked path returns `[]` with
   `untracked:true`. **`restore(vault, path, rev, expected_sha256?)`** writes
-  `git show rev:path` back to disk (snapshotting dirty state first) and can
+  `git show rev:path` back to disk atomically (snapshotting dirty state
+  first), echoes the revision as `restored_from`, and can
   recreate deleted notes.
 
 ## Testing
@@ -144,7 +179,7 @@ versioning and its opt-out), and exits non-zero with a traceback on failure.
 ## Architecture (brief)
 
 ```
-opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 12 tools) <-> ~/.vaults/<project>/*.md
+opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 13 tools) <-> ~/.vaults/<project>/*.md
 ```
 
 - `vaults/` is the whole server: `config.py` (vaults root, logging, CLI),
@@ -153,9 +188,14 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 12 tools) <
   vault creation),
   `indexes.py` (in-memory backlink/frontmatter indexes with mtime-based
   invalidation), `search.py` (ripgrep + Python-fallback search),
-  `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 12
+  `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 13
   tools, stdio bridge). Root `server.py` is a thin shim so `python
   server.py` keeps working.
+- `server.py` keeps the event loop responsive: every tool runs its blocking
+  library call in a worker thread via `anyio.to_thread`. Errors are
+  sanitized at the tool boundary (client-safe `ValueError`s pass through;
+  anything else becomes a plain failure notice) while the server log keeps
+  the full traceback; request logging records only vault/path.
 - `smoke_test.py` spawns `server.py` over stdio with `VAULTS_ROOT` pointed at a temp dir.
 
 ## Limitations
@@ -164,7 +204,8 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 12 tools) <
   (`anyio==4.9.0`, `mcp==1.30.0`, `PyYAML==6.0.3`); bump deliberately and re-run `python smoke_test.py`.
 - **Move is copy + delete, not one atomic rename:** `move_note` writes the
   destination atomically, then unlinks the source — a crash between the two
-  steps can leave both copies behind. It also refuses to overwrite an
+  steps can leave both copies behind. A failed move cleans up the partial
+  destination. It also refuses to overwrite an
   existing destination.
 - **Wiki-link resolution is name-based:** bare `[[Name]]` links resolve via a
   stem index (shortest path wins on collision); only `[[path/with/slash]]`

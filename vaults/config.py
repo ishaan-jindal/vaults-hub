@@ -2,6 +2,7 @@
 
 import argparse
 import functools
+import inspect
 import logging
 import os
 from logging.handlers import RotatingFileHandler
@@ -37,8 +38,14 @@ def _logged(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        vault = kwargs.get("vault", args[0] if args else None)
-        path = kwargs.get("path", kwargs.get("src_path"))
+        try:
+            bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+            vault = bound.arguments.get("vault")
+            params = bound.arguments
+            path = params.get("path", params.get("src_path"))
+        except (TypeError, ValueError):
+            vault = kwargs.get("vault", args[0] if args else None)
+            path = kwargs.get("path", kwargs.get("src_path"))
         _logger.info("vaults.%s called vault=%r path=%r", fn.__name__, vault, path)
         try:
             result = fn(*args, **kwargs)

@@ -65,10 +65,17 @@ def search_notes(
     before = max(0, min(10, int(before)))
     after = max(0, min(10, int(after)))
     limit = max(1, min(200, int(limit)))
+    if regex:
+        try:
+            re.compile(query)
+        except re.error as exc:
+            raise ValueError(f"invalid regular expression: {exc}") from exc
     roots = [_vault_root(vault)] if vault else [Path(v["path"]) for v in list_vaults()]
-    hits = _collect_hits(roots, query, regex, case_sensitive, limit)
+    hits = _collect_hits(roots, query, regex, case_sensitive, limit + 1)
+    truncated = len(hits) > limit
+    hits = hits[:limit]
     _attach_context(hits, roots, before, after)
-    return {"query": query, "matches": hits}
+    return {"query": query, "matches": hits, "limit": limit, "truncated": truncated}
 
 
 def _collect_hits(roots, query, regex, case_sensitive, limit) -> list[dict]:
@@ -79,7 +86,19 @@ def _collect_hits(roots, query, regex, case_sensitive, limit) -> list[dict]:
 
 
 def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
-    args = ["rg", "--json", "-n", "--no-heading", "--glob", "!**/.obsidian/**"]
+    # ponytail: the pure-Python fallback below compiles user regexes with no
+    # per-match timeout, so pathological patterns can ReDoS this process;
+    # ripgrep is the hardened path (linear scan, built-in safeguards).
+    args = [
+        "rg",
+        "--json",
+        "-n",
+        "--no-heading",
+        "--glob",
+        "!**/.obsidian/**",
+        "--glob",
+        "!**/.*",
+    ]
     if not regex:
         args.append("--fixed-strings")
     if not case_sensitive:
@@ -89,8 +108,14 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
     for root in roots:
         try:
             proc = subprocess.run(args + [str(root)], capture_output=True, text=True, timeout=30)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("ripgrep search timed out after 30s") from exc
+        except (FileNotFoundError, OSError) as exc:
+            raise ValueError("ripgrep is not available") from exc
+        if proc.returncode not in (0, 1):
+            first = (proc.stderr or "").strip().splitlines()
+            snippet = first[0][:200] if first else ""
+            raise ValueError("ripgrep search failed: " + snippet)
         for line in proc.stdout.splitlines():
             try:
                 ev = json.loads(line)
@@ -106,6 +131,10 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
             except (KeyError, ValueError, OSError, AttributeError, TypeError):
                 # Non-UTF-8 paths arrive as {"bytes": "<base64>"} with no
                 # "text" key; skip rather than crash the tool.
+                continue
+            if any(part.startswith(".") for part in rel.split("/")):
+                continue
+            if ".obsidian" in rel.split("/"):
                 continue
             hits.append(
                 {
@@ -124,11 +153,23 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
 
 def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
     flags = 0 if case_sensitive else re.IGNORECASE
-    pat = re.compile(query if regex else re.escape(query), flags)
+    try:
+        pat = re.compile(query if regex else re.escape(query), flags)
+    except re.error as exc:
+        raise ValueError(f"invalid regular expression: {exc}") from exc
     hits: list[dict] = []
     for root in roots:
         ignore = _gitignore_patterns(root)
         for p in _all_notes(root):
+            try:
+                rel = _rel(root, p)
+            except ValueError:
+                continue
+            parts = rel.split("/")
+            if any(part.startswith(".") for part in parts):
+                continue
+            if ".obsidian" in parts:
+                continue
             if _gitignored(root, p, ignore):
                 continue
             try:
@@ -141,7 +182,7 @@ def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
                     hits.append(
                         {
                             "vault": root.name,
-                            "path": _rel(root, p),
+                            "path": rel,
                             "line": i,
                             "text": ln.strip(),
                         }
@@ -157,6 +198,8 @@ def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
 def _attach_context(hits, roots, before, after) -> None:
     """Add before_lines/match_line/after_lines by rereading each file once."""
     if not hits:
+        return
+    if before <= 0 and after <= 0:
         return
     vault_to_root = {r.name: r for r in roots}
     cache: dict[tuple[str, str], list[str]] = {}

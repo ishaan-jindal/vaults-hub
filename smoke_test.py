@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -11,6 +12,40 @@ from mcp.client.stdio import stdio_client
 
 HERE = Path(__file__).resolve().parent
 SERVER = HERE / "server.py"
+
+EXPECTED_TOOLS = [
+    "append_note",
+    "create_vault",
+    "delete_note",
+    "history",
+    "list_notes",
+    "list_tags",
+    "list_vaults",
+    "move_note",
+    "read_note",
+    "restore",
+    "search_notes",
+    "server_info",
+    "write_note",
+]
+
+READ_ONLY_TOOLS = {
+    "list_vaults",
+    "list_notes",
+    "read_note",
+    "list_tags",
+    "search_notes",
+    "history",
+    "server_info",
+}
+
+DESTRUCTIVE_TOOLS = {
+    "write_note",
+    "append_note",
+    "move_note",
+    "delete_note",
+    "restore",
+}
 
 
 def out(res):
@@ -22,6 +57,10 @@ def out(res):
     if isinstance(data, dict) and set(data) == {"result"}:
         return data["result"]
     return data
+
+
+def err_text(res):
+    return res.content[0].text if res.content else ""
 
 
 def write_fixture(root: Path) -> None:
@@ -49,30 +88,60 @@ async def main() -> int:
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                init = await session.initialize()
                 print("initialized")
+                assert init.serverInfo.name == "vaults", init.serverInfo
+                assert init.serverInfo.version == "0.1.0", init.serverInfo
 
-                tools = sorted(tool.name for tool in (await session.list_tools()).tools)
-                assert tools == [
-                    "append_note",
-                    "create_vault",
-                    "delete_note",
-                    "history",
-                    "list_notes",
-                    "list_tags",
-                    "list_vaults",
-                    "move_note",
-                    "read_note",
-                    "restore",
-                    "search_notes",
-                    "write_note",
-                ], tools
+                listed_tools = (await session.list_tools()).tools
+                tools = sorted(tool.name for tool in listed_tools)
+                assert tools == EXPECTED_TOOLS, tools
+                by_name = {tool.name: tool for tool in listed_tools}
+                for name in EXPECTED_TOOLS:
+                    assert by_name[name].annotations is not None, name
+                    assert by_name[name].annotations.title, name
+                    assert by_name[name].annotations.openWorldHint is False, name
+                for name in READ_ONLY_TOOLS:
+                    assert by_name[name].annotations.readOnlyHint is True, name
+                for name in DESTRUCTIVE_TOOLS:
+                    assert by_name[name].annotations.destructiveHint is True, name
+                made_ann = by_name["create_vault"].annotations
+                assert made_ann.idempotentHint is True, made_ann
+                assert made_ann.destructiveHint is False, made_ann
+
+                # JSON schema advertises the numeric bounds.
+                limit_schema = by_name["list_notes"].inputSchema["properties"]["limit"]
+                assert limit_schema.get("minimum") == 1, limit_schema
+                assert limit_schema.get("maximum") == 500, limit_schema
+                assert by_name["list_notes"].inputSchema["properties"]["offset"].get("minimum") == 0
+                search_schema = by_name["search_notes"].inputSchema["properties"]
+                assert search_schema["limit"].get("maximum") == 200, search_schema["limit"]
+                assert search_schema["before"].get("maximum") == 10, search_schema["before"]
+                assert search_schema["after"].get("maximum") == 10, search_schema["after"]
+                assert by_name["history"].inputSchema["properties"]["limit"].get("maximum") == 200
+                print("tool registry OK")
 
                 listed = out(await session.call_tool("list_vaults", {}))
                 assert {item["name"]: item["notes"] for item in listed} == {
                     "Runnix": 1,
                     "Termchat": 3,
                 }
+
+                info = out(await session.call_tool("server_info", {}))
+                assert set(info) == {
+                    "version",
+                    "python",
+                    "platform",
+                    "git_available",
+                    "ripgrep_available",
+                    "git_enabled",
+                    "vaults_root",
+                    "vault_count",
+                }, info
+                assert info["version"] == "0.1.0", info
+                assert info["git_enabled"] is True, info
+                assert info["vaults_root"] == str(vaults), info
+                assert info["vault_count"] == len(listed), info
 
                 made = out(await session.call_tool("create_vault", {"vault": "Newvault"}))
                 assert made["created"] is True, made
@@ -83,6 +152,13 @@ async def main() -> int:
                 assert bad_name.isError, "vault traversal was not rejected"
                 relisted = out(await session.call_tool("list_vaults", {}))
                 assert "Newvault" in {item["name"] for item in relisted}, relisted
+
+                # Unknown vault names get a client-safe error with valid choices.
+                unknown = await session.call_tool("read_note", {"vault": "Termcha", "path": "x.md"})
+                assert unknown.isError, "unknown vault was not rejected"
+                unknown_text = err_text(unknown)
+                assert "valid:" in unknown_text, unknown_text
+                assert "did you mean" in unknown_text, unknown_text
 
                 home = out(
                     await session.call_tool(
@@ -99,10 +175,30 @@ async def main() -> int:
                 )
                 assert not broken.isError, "non-UTF-8 note must not crash read_note"
 
+                # Second Runnix match so truncation can be exercised below.
+                await session.call_tool(
+                    "write_note",
+                    {"vault": "Runnix", "path": "more.md", "content": "Runnix again.\n"},
+                )
                 hits = out(
                     await session.call_tool("search_notes", {"query": "Runnix", "vault": "Runnix"})
                 )
                 assert hits["matches"], "expected fixture search hit"
+                assert hits["limit"] == 50, hits
+                assert hits["truncated"] is False, hits
+                plain_hit = hits["matches"][0]
+                assert "before_lines" not in plain_hit, plain_hit
+                assert "match_line" not in plain_hit, plain_hit
+                assert "after_lines" not in plain_hit, plain_hit
+
+                trunc = out(
+                    await session.call_tool(
+                        "search_notes", {"query": "Runnix", "vault": "Runnix", "limit": 1}
+                    )
+                )
+                assert trunc["limit"] == 1, trunc
+                assert len(trunc["matches"]) == 1, trunc
+                assert trunc["truncated"] is True, trunc
 
                 body = "---\ntitle: Hub Smoke\nupdated: 2000-01-01\n---\n\nsmoke\n"
                 created = out(
@@ -130,6 +226,25 @@ async def main() -> int:
                 )
                 assert appended["previous_sha256"] == created["sha256"]
 
+                # read_note sha chaining: read -> write with the fresh sha.
+                current = out(
+                    await session.call_tool(
+                        "read_note", {"vault": "Termchat", "path": "Scratch.md"}
+                    )
+                )
+                chained = out(
+                    await session.call_tool(
+                        "write_note",
+                        {
+                            "vault": "Termchat",
+                            "path": "Scratch.md",
+                            "content": current["content"] + "chained\n",
+                            "expected_sha256": current["sha256"],
+                        },
+                    )
+                )
+                assert chained["previous_sha256"] == current["sha256"], chained
+
                 await session.call_tool(
                     "write_note",
                     {
@@ -150,6 +265,39 @@ async def main() -> int:
                 assert conflict.isError, "stale write was not rejected"
                 assert not list((vaults / "Termchat").glob(".Scratch.md.*.tmp"))
 
+                # NUL bytes are never valid note content.
+                nul = await session.call_tool(
+                    "write_note",
+                    {"vault": "Termchat", "path": "Nul.md", "content": "a\x00b\n"},
+                )
+                assert nul.isError, "NUL byte content was not rejected"
+
+                # Writes preserve the existing file mode (POSIX only).
+                if os.name == "posix":
+                    await session.call_tool(
+                        "write_note",
+                        {"vault": "Termchat", "path": "Mode.md", "content": "v1\n"},
+                    )
+                    os.chmod(vaults / "Termchat" / "Mode.md", 0o644)
+                    await session.call_tool(
+                        "write_note",
+                        {"vault": "Termchat", "path": "Mode.md", "content": "v2\n"},
+                    )
+                    mode = os.stat(vaults / "Termchat" / "Mode.md").st_mode & 0o777
+                    assert mode == 0o644, oct(mode)
+
+                # append_note creates a missing note.
+                await session.call_tool(
+                    "append_note",
+                    {"vault": "Termchat", "path": "BrandNew.md", "text": "fresh\n"},
+                )
+                brand_new = out(
+                    await session.call_tool(
+                        "read_note", {"vault": "Termchat", "path": "BrandNew.md"}
+                    )
+                )
+                assert "fresh" in brand_new["content"], brand_new
+
                 traversal = await session.call_tool(
                     "read_note", {"vault": "Termchat", "path": "../outside.md"}
                 )
@@ -166,6 +314,9 @@ async def main() -> int:
                 )
                 flat = out(await session.call_tool("list_notes", {"vault": "Termchat", "path": ""}))
                 assert "Sub/inner.md" not in flat["notes"], flat
+                assert flat["total"] == len(flat["dirs"]) + len(flat["notes"]), flat
+                assert flat["offset"] == 0 and flat["limit"] == 200, flat
+                assert flat["truncated"] is False and flat["next_offset"] is None, flat
                 rec = out(
                     await session.call_tool(
                         "list_notes",
@@ -174,6 +325,40 @@ async def main() -> int:
                 )
                 assert rec["dirs"] == [], rec
                 assert "Sub/inner.md" in rec["notes"], rec
+
+                # list_notes pagination over a dedicated vault.
+                await session.call_tool("create_vault", {"vault": "Pagevault"})
+                for name in ("a.md", "b.md", "c.md"):
+                    await session.call_tool(
+                        "write_note",
+                        {"vault": "Pagevault", "path": name, "content": f"{name}\n"},
+                    )
+                page1 = out(
+                    await session.call_tool(
+                        "list_notes", {"vault": "Pagevault", "path": "", "limit": 2}
+                    )
+                )
+                assert page1["total"] == 3, page1
+                assert page1["offset"] == 0 and page1["limit"] == 2, page1
+                assert page1["truncated"] is True and page1["next_offset"] == 2, page1
+                assert len(page1["notes"]) == 2, page1
+                page2 = out(
+                    await session.call_tool(
+                        "list_notes",
+                        {"vault": "Pagevault", "path": "", "offset": 2, "limit": 2},
+                    )
+                )
+                assert page2["truncated"] is False and page2["next_offset"] is None, page2
+                assert len(page2["notes"]) == 1, page2
+                assert page1["notes"] + page2["notes"] == sorted(["a.md", "b.md", "c.md"]), (
+                    page1,
+                    page2,
+                )
+                past_end = await session.call_tool(
+                    "list_notes", {"vault": "Pagevault", "path": "", "offset": 250}
+                )
+                assert past_end.isError, "offset past total was not rejected"
+                assert "250" in err_text(past_end), err_text(past_end)
 
                 # D + G: tags (list form + string form, normalized to list)
                 await session.call_tool(
@@ -229,6 +414,7 @@ async def main() -> int:
                     )
                 )
                 assert ctx["matches"], "expected context search hit"
+                assert ctx["truncated"] is False, ctx
                 hit = next(m for m in ctx["matches"] if m["path"] == "Context.md")
                 assert hit["before_lines"] == ["l1", "l2"], hit
                 assert hit["match_line"] == "l3 target", hit
@@ -304,6 +490,9 @@ async def main() -> int:
                 )
                 assert moved["dst_path"] == "NewName.md", moved
                 assert len(moved["sha256"]) == 64, moved
+                assert list((vaults / "Termchat").glob("*.tmp")) == [], list(
+                    (vaults / "Termchat").glob("*.tmp")
+                )
                 old_gone = await session.call_tool(
                     "read_note", {"vault": "Termchat", "path": "OldName.md"}
                 )
@@ -352,6 +541,7 @@ async def main() -> int:
                 )
                 assert hist["untracked"] is False, hist
                 assert len(hist["history"]) == 1, hist
+                assert hist["truncated"] is False, hist
                 assert "write" in hist["history"][0]["message"], hist
                 assert len(hist["history"][0]["sha"]) == 40, hist
                 await session.call_tool(
@@ -363,12 +553,21 @@ async def main() -> int:
                 )
                 assert len(hist2["history"]) == 2, hist2
                 assert hist2["history"][0]["date"], hist2
+                assert hist2["truncated"] is False, hist2
+                hist_page = out(
+                    await session.call_tool(
+                        "history", {"vault": "Termchat", "path": "Vcs.md", "limit": 1}
+                    )
+                )
+                assert len(hist_page["history"]) == 1, hist_page
+                assert hist_page["truncated"] is True, hist_page
                 fresh_hist = out(
                     await session.call_tool(
                         "history", {"vault": "Termchat", "path": "NeverWritten.md"}
                     )
                 )
                 assert fresh_hist["history"] == [] and fresh_hist["untracked"] is True, fresh_hist
+                assert fresh_hist["truncated"] is False, fresh_hist
                 await session.call_tool("delete_note", {"vault": "Termchat", "path": "Vcs.md"})
                 assert not (vaults / "Termchat" / "Vcs.md").exists()
                 first_sha = hist2["history"][-1]["sha"]
@@ -382,6 +581,8 @@ async def main() -> int:
                     restored
                 )
                 assert restored["sha256"] == v1["sha256"], restored
+                assert restored["restored_from"] == first_sha, restored
+                assert "previous_sha256" in restored, restored
                 bad_rev = await session.call_tool(
                     "restore",
                     {"vault": "Termchat", "path": "Vcs.md", "rev": "deadbeef" * 5},
@@ -402,6 +603,9 @@ async def main() -> int:
         async with stdio_client(params_off) as (read, write):
             async with ClientSession(read, write) as off:
                 await off.initialize()
+                off_info = out(await off.call_tool("server_info", {}))
+                assert off_info["git_enabled"] is False, off_info
+                assert off_info["vaults_root"] == str(vaults), off_info
                 w = out(
                     await off.call_tool(
                         "write_note",

@@ -6,6 +6,7 @@ functions that need them so notes <-> indexes has no import cycle.
 """
 
 import contextlib
+import difflib
 import hashlib
 import os
 import re
@@ -22,15 +23,30 @@ import yaml
 
 from vaults import config
 
-FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?", re.DOTALL)
+FRONTMATTER_RE = re.compile("\\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?", re.DOTALL)
 WIKI_LINK_RE = re.compile(r"!?\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
-UPDATED_RE = re.compile(r"(?m)^updated:.*$")
+UPDATED_RE = re.compile(r"(?m)^updated:[^\r\n]*")
 
 
 def _vault_root(vault: str) -> Path:
+    if not vault:
+        vault = ""
     root = (config.VAULTS_ROOT / vault).resolve()
     if root.parent != config.VAULTS_ROOT or not root.is_dir():
-        raise ValueError(f"unknown vault: {vault!r}")
+        try:
+            valid = sorted(
+                d.name
+                for d in config.VAULTS_ROOT.iterdir()
+                if d.is_dir() and not d.name.startswith(".")
+            )
+        except OSError:
+            valid = []
+        detail = ", ".join(valid) if valid else "(none)"
+        suggestion = ""
+        close = difflib.get_close_matches(vault, valid, n=1, cutoff=0.6)
+        if close:
+            suggestion = f"; did you mean {close[0]!r}?"
+        raise ValueError(f"unknown vault: {vault!r} (valid: {detail}{suggestion})")
     return root
 
 
@@ -39,6 +55,10 @@ def _rel(root: Path, p: Path) -> str:
 
 
 def _note_path(root: Path, rel: str) -> Path:
+    # ponytail: resolve-then-use leaves a theoretical TOCTOU window against a
+    # hostile local process that swaps symlinks between check and use; the
+    # upgrade path is openat2/O_NOFOLLOW-based traversal that never follows
+    # an untrusted symlink. Benign multi-process use (editors, sync) is safe.
     p = (root / rel).resolve()
     if p != root and root not in p.parents:
         raise ValueError(f"path escapes vault: {rel!r}")
@@ -50,7 +70,9 @@ def _sha256(text: str) -> str:
 
 
 def _ensure_utf8(content: str) -> None:
-    """Reject lone surrogates. Raises ValueError, never UnicodeEncodeError."""
+    """Reject lone surrogates and NUL bytes. Raises ValueError, never UnicodeEncodeError."""
+    if "\x00" in content:
+        raise ValueError("note content must not contain NUL bytes")
     try:
         content.encode("utf-8", errors="strict")
     except (UnicodeEncodeError, ValueError) as exc:
@@ -103,15 +125,30 @@ def _note_locks_two(first: Path, second: Path):
 
 def _atomic_write(path: Path, content: str) -> None:
     """Replace a note without exposing a partially written file."""
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o600
     fd, temporary_path = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
     )
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as temporary_file:
             temporary_file.write(content)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, path)
+        try:
+            dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return
+        try:
+            os.fsync(dfd)
+        except OSError:
+            pass
+        finally:
+            os.close(dfd)
     except BaseException:
         try:
             os.unlink(temporary_path)
@@ -181,8 +218,12 @@ def _split_frontmatter(text: str) -> tuple[dict, str]:
 def _refresh_updated(text: str) -> tuple[str, bool]:
     """Bump `updated:` in the frontmatter block. Returns (text, changed)."""
     m = FRONTMATTER_RE.match(text)
-    if not m or "updated:" not in m.group(1):
+    if not m:
         return text, False
+    if "updated:" not in m.group(1):
+        nl = "\r\n" if "\r\n" in m.group(0) else "\n"
+        inserted = f"updated: {date.today().isoformat()}{nl}" + m.group(1)
+        return text[: m.start(1)] + inserted + text[m.end(1) :], True
     new_block = UPDATED_RE.sub(f"updated: {date.today().isoformat()}", m.group(1), count=1)
     return text[: m.start(1)] + new_block + text[m.end(1) :], True
 
@@ -279,9 +320,16 @@ def create_vault(vault: str) -> dict:
     from vaults.indexes import _invalidate_vault  # deferred: avoids notes<->indexes cycle
 
     name = (vault or "").strip()
-    if not name or name in (".", "..") or "/" in name or "\\" in name or ".." in name:
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or name.startswith(".")
+        or Path(name).is_absolute()
+    ):
         raise ValueError(f"invalid vault name: {vault!r}")
-    if Path(name).is_absolute():
+    if (config.VAULTS_ROOT / name).is_symlink():
         raise ValueError(f"invalid vault name: {vault!r}")
     root = (config.VAULTS_ROOT / name).resolve()
     if root.parent != config.VAULTS_ROOT:
@@ -296,11 +344,15 @@ def create_vault(vault: str) -> dict:
     return {"vault": name, "path": str(root), "created": True}
 
 
-def list_notes(vault: str, path: str = "", recursive: bool = False) -> dict:
+def list_notes(
+    vault: str, path: str = "", recursive: bool = False, offset: int = 0, limit: int = 200
+) -> dict:
     root = _vault_root(vault)
     base = _note_path(root, path or ".")
     if not base.is_dir():
         raise ValueError(f"not a directory: {path!r}")
+    offset = max(0, int(offset))
+    limit = max(1, min(500, int(limit)))
     if recursive:
         notes = []
         for p in sorted(base.rglob("*.md")):
@@ -313,7 +365,22 @@ def list_notes(vault: str, path: str = "", recursive: bool = False) -> dict:
             if any(part.startswith(".") for part in parts):
                 continue
             notes.append(p.resolve().relative_to(root).as_posix())
-        return {"vault": vault, "path": path, "dirs": [], "notes": notes}
+        total = len(notes)
+        if offset > total:
+            raise ValueError(f"list_notes: offset {offset} out of range (total {total})")
+        page = notes[offset : offset + limit]
+        truncated = total > offset + len(page)
+        return {
+            "vault": vault,
+            "path": path,
+            "dirs": [],
+            "notes": page,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "truncated": truncated,
+            "next_offset": offset + len(page) if truncated else None,
+        }
     dirs, notes = [], []
     for p in sorted(base.iterdir()):
         if p.name.startswith("."):
@@ -322,7 +389,25 @@ def list_notes(vault: str, path: str = "", recursive: bool = False) -> dict:
             dirs.append(_rel(root, p) + "/")
         elif p.suffix == ".md":
             notes.append(_rel(root, p))
-    return {"vault": vault, "path": path, "dirs": dirs, "notes": notes}
+    combined = [*dirs, *notes]
+    total = len(combined)
+    if offset > total:
+        raise ValueError(f"list_notes: offset {offset} out of range (total {total})")
+    page = combined[offset : offset + limit]
+    dirs_page = [entry for entry in page if entry.endswith("/")]
+    notes_page = [entry for entry in page if not entry.endswith("/")]
+    truncated = total > offset + len(page)
+    return {
+        "vault": vault,
+        "path": path,
+        "dirs": dirs_page,
+        "notes": notes_page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "truncated": truncated,
+        "next_offset": offset + len(page) if truncated else None,
+    }
 
 
 def read_note(vault: str, path: str) -> dict:
@@ -330,6 +415,8 @@ def read_note(vault: str, path: str) -> dict:
 
     root = _vault_root(vault)
     p = _note_path(root, path)
+    if p.suffix != ".md":
+        raise ValueError("note path must end in .md")
     if not p.is_file():
         raise ValueError(f"note not found: {path!r}")
     _ensure_indexes(root, vault)
@@ -379,7 +466,10 @@ def _write_note_locked(
             "note has changed since the supplied expected_sha256; read it again before writing"
         )
     content, refreshed = _refresh_updated(content)
-    _atomic_write(p, content)
+    try:
+        _atomic_write(p, content)
+    except OSError as exc:
+        raise ValueError(f"cannot write {p!r}: {exc.strerror or type(exc).__name__}") from exc
     rel = _rel(root, p)
     new_sha = _sha256(content)
     versioning = _git_result(root, root.name, [rel], f"vaults: {op} {rel}", new_sha)
@@ -396,6 +486,7 @@ def _write_note_locked(
 
 
 def write_note(vault: str, path: str, content: str, expected_sha256: str | None = None) -> dict:
+    _ensure_utf8(content)
     root = _vault_root(vault)
     p = _note_path(root, path)
     with _note_lock(p):
@@ -443,6 +534,10 @@ def delete_note(vault: str, path: str, missing_ok: bool = False) -> dict:
             if not missing_ok:
                 raise ValueError(f"note not found: {path!r}")
             return {"vault": vault, "path": path, "sha256_before": None}
+        except OSError as exc:
+            raise ValueError(
+                f"cannot delete {path!r}: {exc.strerror or type(exc).__name__}"
+            ) from exc
         for tmp in p.parent.glob(f".{p.name}.*.tmp"):
             try:
                 tmp.unlink()
@@ -475,6 +570,8 @@ def move_note(
     dst = _note_path(root, dst_path)
     if src.resolve() == dst.resolve():
         raise ValueError("src and dst are the same note")
+    if src.suffix != ".md":
+        raise ValueError("note path must end in .md")
     if dst.suffix != ".md":
         raise ValueError("note path must end in .md")
     with _note_locks_two(src, dst):
@@ -493,11 +590,28 @@ def move_note(
         _ensure_utf8(previous)
         dst.parent.mkdir(parents=True, exist_ok=True)
         content, _ = _refresh_updated(previous)
-        _atomic_write(dst, content)
         try:
-            src.unlink()
-        except FileNotFoundError as exc:
-            raise ValueError(f"note not found: {src_path!r}") from exc
+            _atomic_write(dst, content)
+            try:
+                src.unlink()
+            except FileNotFoundError as exc:
+                try:
+                    dst.unlink()
+                except OSError:
+                    pass
+                raise ValueError(f"note not found: {src_path!r}") from exc
+            except OSError as exc:
+                try:
+                    dst.unlink()
+                except OSError:
+                    pass
+                raise ValueError(
+                    f"cannot move {src_path!r} to {dst_path!r}: "
+                    f"{exc.strerror or type(exc).__name__}"
+                ) from exc
+        finally:
+            with contextlib.suppress(Exception):
+                _invalidate_vault(vault)
         for tmp in src.parent.glob(f".{src.name}.*.tmp"):
             try:
                 tmp.unlink()
