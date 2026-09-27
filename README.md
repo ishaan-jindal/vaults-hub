@@ -1,6 +1,7 @@
 # vaults-hub
 
 [![M8ven Score](https://m8ven.ai/badge/mcp/ishaan-jindal/vaults-hub)](https://m8ven.ai/mcp/ishaan-jindal/vaults-hub)
+[![npm](https://img.shields.io/npm/v/vaults-hub.svg)](https://www.npmjs.com/package/vaults-hub)
 
 A Python [MCP](https://modelcontextprotocol.io) server that exposes your
 [Obsidian](https://obsidian.md)-style Markdown vaults to MCP clients (e.g. OpenCode).
@@ -12,16 +13,18 @@ local git, so nothing is ever truly lost.
 
 ## Quickstart
 
-The fastest way — no clone, no venv:
+The fastest way — no clone, no venv. Published on npm as
+[`vaults-hub`](https://www.npmjs.com/package/vaults-hub):
 
 ```bash
 npx -y vaults-hub
 ```
 
 This needs Python 3.10+ on `PATH` (or `VAULTS_HUB_PYTHON` set to its
-path). On first run it bootstraps the pinned dependencies from
-`requirements.txt` into a cached venv (one-time, ~30s; later runs start
-instantly); see [Configuration](#configuration) for the cache location.
+path); CI tests 3.10, 3.12 and 3.14. On first run it bootstraps the pinned
+dependencies from `requirements.txt` into a cached venv (one-time, ~30s;
+later runs start instantly); see [Configuration](#configuration) for the
+cache location.
 
 From source (offline/dev alternative) — prereqs are Python 3.10+
 (developed/tested on 3.14), a POSIX platform (Linux/macOS — locking uses
