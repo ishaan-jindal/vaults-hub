@@ -99,6 +99,26 @@ Also built in: YAML-frontmatter parsing with auto-refreshed `updated:` dates,
 file locking (`fcntl`), atomic writes via temp-file + rename, backlink/tag
 indexes with mtime invalidation, and optional debug logging to file.
 
+### Tool annotations
+
+Every tool declares all four MCP `ToolAnnotations` hints explicitly, so
+hosts that gate on them (OpenAI's tool directory rejects a tool where any
+hint is missing or non-boolean) accept the whole set:
+
+| Hint | Meaning here | Value |
+| ---- | ------------- | ----- |
+| `readOnlyHint` | does not modify the vault | `true` for the 7 read tools, `false` for the rest |
+| `destructiveHint` | may destroy or overwrite existing data | `true` for `write_note`, `append_note`, `move_note`, `delete_note`, `delete_vault`, `restore`; `false` elsewhere |
+| `idempotentHint` | repeat calls add no further effect | `true` for the 7 read tools and `create_vault`; `false` otherwise |
+| `openWorldHint` | touches entities outside the vaults root | `false` for every tool — this server is closed-world by construction |
+
+The hints are hints, not guarantees: a client must not make trust decisions
+from them alone. They matter because the stdio writer serializes tool
+payloads with `exclude_none=True`, so an unset hint is dropped from
+`tools/list` entirely rather than sent as `null`. `smoke_test.py` asserts
+all four are present booleans on all 14 tools, so a new tool cannot
+silently reintroduce the gap.
+
 ## Reliability
 
 How the server avoids losing or corrupting notes:
