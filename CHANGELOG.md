@@ -2,7 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-09-27
+
+- npm package (`vaults-hub` bin): run via `npx -y vaults-hub`; the launcher
+  finds Python 3.10+ and bootstraps the pinned deps into a cached venv.
 
 - Local git versioning per vault (default-on, opt-out via `VAULTS_HUB_GIT=0`):
   lazy `git init` on first mutation, path-scoped commits with `Sha256:`

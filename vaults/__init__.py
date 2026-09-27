@@ -6,7 +6,7 @@ so opencode can read/write/search all vaults with no Obsidian windows, ports,
 or API keys involved. Spawned per-session by opencode over stdio.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["__version__", "main", "mcp"]
 

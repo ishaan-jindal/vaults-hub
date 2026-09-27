@@ -1,0 +1,42 @@
+{
+  "name": "vaults-hub",
+  "version": "0.2.0",
+  "description": "Stdio MCP server for Obsidian-style Markdown vaults",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "vaults-hub": "bin/vaults-hub.mjs"
+  },
+  "files": [
+    "bin/",
+    "vaults/",
+    "server.py",
+    "requirements.txt",
+    "README.md",
+    "LICENSE",
+    "!vaults/__pycache__",
+    "!**/__pycache__"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ishaan-jindal/vaults-hub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ishaan-jindal/vaults-hub/issues"
+  },
+  "homepage": "https://github.com/ishaan-jindal/vaults-hub",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "markdown",
+    "notes",
+    "obsidian",
+    "vault",
+    "stdio",
+    "local-first"
+  ]
+}

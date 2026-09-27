@@ -23,7 +23,7 @@ from vaults import search as _search
 from vaults import versioning as _versioning
 from vaults.config import _logged, _parse_args, _resolve_vaults_root
 
-SERVER_VERSION = "0.1.0"  # keep in sync with pyproject.toml [project] version
+SERVER_VERSION = "0.2.0"  # keep in sync with pyproject.toml [project] version
 
 mcp = FastMCP(
     "vaults",

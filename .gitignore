@@ -5,3 +5,13 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .DS_Store
+
+# build + packaging artifacts
+dist/
+build/
+*.whl
+*.tar.gz
+*.tgz
+
+# node (npm wrapper)
+node_modules/

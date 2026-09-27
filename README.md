@@ -1,6 +1,6 @@
 # vaults-hub
 
-[![M8ven Score](https://m8ven.ai/badge/mcp/ishaan-jindal-vaults-hub-zaplmq?v=2bb4b0f0fe2d184af866aa4d8a981d7a)](https://m8ven.ai/mcp/ishaan-jindal-vaults-hub-zaplmq)
+[![M8ven Score](https://m8ven.ai/badge/mcp/ishaan-jindal/vaults-hub)](https://m8ven.ai/mcp/ishaan-jindal/vaults-hub)
 
 A Python [MCP](https://modelcontextprotocol.io) server that exposes your
 [Obsidian](https://obsidian.md)-style Markdown vaults to MCP clients (e.g. OpenCode).
@@ -12,13 +12,25 @@ local git, so nothing is ever truly lost.
 
 ## Quickstart
 
-Prereqs: Python 3.10+ (developed/tested on 3.14), a POSIX platform
-(Linux/macOS — locking uses `fcntl`), and optionally
-[ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) for faster search
-(a pure-Python fallback is used when `rg` is absent).
+The fastest way — no clone, no venv:
 
 ```bash
-git clone <repo-url> vaults-hub
+npx -y vaults-hub
+```
+
+This needs Python 3.10+ on `PATH` (or `VAULTS_HUB_PYTHON` set to its
+path). On first run it bootstraps the pinned dependencies from
+`requirements.txt` into a cached venv (one-time, ~30s; later runs start
+instantly); see [Configuration](#configuration) for the cache location.
+
+From source (offline/dev alternative) — prereqs are Python 3.10+
+(developed/tested on 3.14), a POSIX platform (Linux/macOS — locking uses
+`fcntl`), and optionally [ripgrep](https://github.com/BurntSushi/ripgrep)
+(`rg`) for faster search (a pure-Python fallback is used when `rg` is
+absent):
+
+```bash
+git clone https://github.com/ishaan-jindal/vaults-hub.git vaults-hub
 cd vaults-hub
 python -m venv .venv
 source .venv/bin/activate
@@ -38,7 +50,26 @@ python server.py --vaults-root "$HOME/my-notes"   # flag wins over env var
 ### Register with OpenCode
 
 Add to your `opencode.jsonc` (adjust paths to your machine — do **not**
-copy any hardcoded home directory):
+copy any hardcoded home directory). The npx form is recommended:
+
+```jsonc
+{
+  "mcp": {
+    "vaults": {
+      "type": "local",
+      "command": "npx",
+      "args": ["-y", "vaults-hub"],
+      // Pick ONE way to point at your vaults (flag wins over env var):
+      "environment": {
+        "VAULTS_ROOT": "<path-to-your-vaults>"
+      }
+    }
+  }
+}
+```
+
+The local-venv form is the offline/dev alternative (replace with the
+actual paths on your machine):
 
 ```jsonc
 {
@@ -166,6 +197,13 @@ Notes:
 
 - **ripgrep is optional.** If `rg` is on `PATH`, `search_notes` uses `rg --json`; otherwise a pure-Python fallback (with minimal `.gitignore` handling) is used. No configuration needed either way.
 - **POSIX-only.** File locking uses `fcntl`, so Windows is not supported.
+- **npx launcher.** `VAULTS_HUB_PYTHON` overrides which Python the
+  `vaults-hub` bin uses (else `python3`, then `python` on `PATH`;
+  must be 3.10+). When that interpreter lacks the pinned dependencies,
+  the bin installs them once into a cached venv under
+  `$XDG_CACHE_HOME/vaults-hub` (else `~/.cache/vaults-hub`), keyed by
+  Python minor version, and reuses it silently while the
+  `requirements.txt` hash matches.
 
 ## Versioning
 
@@ -239,3 +277,11 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 14 tools) <
 - **No authentication:** the stdio transport trusts the local client; do not
   expose vault contents beyond your machine without adding your own access
   controls.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and the PR flow.
