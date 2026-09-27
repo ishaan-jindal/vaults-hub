@@ -10,6 +10,7 @@ import difflib
 import hashlib
 import os
 import re
+import shutil
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
@@ -315,11 +316,13 @@ def list_vaults() -> list[dict]:
     ]
 
 
-def create_vault(vault: str) -> dict:
-    """Create a vault dir. Idempotent: existing vault returns created=False."""
-    from vaults.indexes import _invalidate_vault  # deferred: avoids notes<->indexes cycle
+def _valid_vault_name(name: str) -> Path:
+    """Validate a vault name and return its literal path under the vaults root.
 
-    name = (vault or "").strip()
+    One non-hidden component directly under VAULTS_ROOT, never a symlink:
+    _vault_root resolves through symlinks, so a `foo -> bar` alias would make
+    a caller operate on `bar` instead.
+    """
     if (
         not name
         or name in (".", "..")
@@ -328,20 +331,75 @@ def create_vault(vault: str) -> dict:
         or name.startswith(".")
         or Path(name).is_absolute()
     ):
-        raise ValueError(f"invalid vault name: {vault!r}")
-    if (config.VAULTS_ROOT / name).is_symlink():
-        raise ValueError(f"invalid vault name: {vault!r}")
-    root = (config.VAULTS_ROOT / name).resolve()
-    if root.parent != config.VAULTS_ROOT:
-        raise ValueError(f"invalid vault name: {vault!r}")
-    if root.is_dir():
-        return {"vault": name, "path": str(root), "created": False}
-    if root.exists():
-        raise ValueError(f"invalid vault name: {vault!r}")
-    root.mkdir(parents=True, exist_ok=True)
+        raise ValueError(f"invalid vault name: {name!r}")
+    target = config.VAULTS_ROOT / name
+    if target.is_symlink():
+        raise ValueError(f"invalid vault name: {name!r}")
+    if target.resolve().parent != config.VAULTS_ROOT:
+        raise ValueError(f"invalid vault name: {name!r}")
+    return target
+
+
+def create_vault(vault: str) -> dict:
+    """Create a vault dir. Idempotent: existing vault returns created=False."""
+    from vaults.indexes import _invalidate_vault  # deferred: avoids notes<->indexes cycle
+
+    name = (vault or "").strip()
+    target = _valid_vault_name(name)
+    if target.is_dir():
+        return {"vault": name, "path": str(target), "created": False}
+    if target.exists():
+        raise ValueError(f"invalid vault name: {name!r}")
+    target.mkdir(parents=True, exist_ok=True)
     _invalidate_vault(name)
     # NOTE: no git init here; first write lazily inits via versioning._git_mode.
-    return {"vault": name, "path": str(root), "created": True}
+    return {"vault": name, "path": str(target), "created": True}
+
+
+def delete_vault(vault: str, confirm: str) -> dict:
+    """Delete a whole vault tree, including notes, lock files, and git history.
+
+    History dies with the tree; there is no undo in this server.
+    """
+    from vaults.indexes import (
+        _all_notes,
+        _invalidate_vault,
+    )  # deferred: avoids notes<->indexes cycle
+    from vaults.versioning import _GIT_MODE, _git_lock  # deferred: avoids notes<->versioning cycle
+
+    name = (vault or "").strip()
+    target = _valid_vault_name(name)
+    if confirm != name:
+        raise ValueError(f"confirm must exactly equal the vault name: got {confirm!r}")
+    if not target.is_dir():
+        # Delegate to the canonical resolver so a mis-typed name gets the valid-vault
+        # list and a close-name suggestion; only the is_dir branch can fail here.
+        _vault_root(name)
+
+    notes_removed = len(_all_notes(target))
+    git_history = "removed" if (target / ".git").exists() else "none"
+
+    trash = config.VAULTS_ROOT / f".{name}.deleted-{os.getpid()}"
+    n = 0
+    while trash.exists():
+        n += 1
+        trash = config.VAULTS_ROOT / f".{name}.deleted-{os.getpid()}.{n}"
+    # ponytail: rename cuts the vault out of the namespace atomically so rivals see
+    # "unknown vault" not ENOENT; _git_lock is belt-and-braces (its file dies with the
+    # tree) and a crash leaves a hidden `.name.deleted-<pid>` dir that list_vaults
+    # filters out and we deliberately never auto-clean.
+    with _git_lock(target):
+        os.rename(target, trash)
+        _invalidate_vault(name)
+        _GIT_MODE.pop(name, None)
+        shutil.rmtree(trash)
+    return {
+        "vault": name,
+        "path": str(target),
+        "deleted": True,
+        "notes_removed": notes_removed,
+        "git_history": git_history,
+    }
 
 
 def list_notes(

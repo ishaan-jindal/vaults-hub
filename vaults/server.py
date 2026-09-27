@@ -118,6 +118,24 @@ async def create_vault(vault: Annotated[str, Field(description="Vault name")]) -
 
 
 @mcp.tool(
+    description="Delete a whole vault: removes every note, lock file and the git history. "
+    "Irreversible with no undo in this server; confirm must exactly equal the vault name.",
+    annotations=ToolAnnotations(
+        title="Delete vault",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+async def delete_vault(
+    vault: Annotated[str, Field(description="Vault name")],
+    confirm: Annotated[str, Field(description="Must exactly equal the vault name")],
+) -> dict:
+    return await _run_off_loop("delete_vault", _notes.delete_vault, vault=vault, confirm=confirm)
+
+
+@mcp.tool(
     description="List directories and notes under a vault path (vault-root-relative, "
     "'' for root). Pass recursive=True to list all descendant notes flat (dirs=[]). "
     "Paginate with offset/limit (default limit 200, max 500); the response carries "

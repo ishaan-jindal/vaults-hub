@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
 - Vaults root (`~/.vaults` default) is auto-created on startup when missing.
 - Every tool now declares all four MCP annotation hints explicitly
   (readOnlyHint/destructiveHint/idempotentHint/openWorldHint).
+- New `delete_vault` tool: removes the whole vault tree including per-vault
+  git history, gated on `confirm` matching the vault name. Irreversible.
 
 ## [0.1.0] - 2026-09-24
 

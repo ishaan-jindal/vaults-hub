@@ -73,15 +73,17 @@ With the server registered as `vaults`:
 
 ## Tools
 
-13 tools (see `vaults/server.py` for exact descriptions). Read-only tools are
-marked **R**, mutating tools **M** (every mutation honors `expected_sha256`
-for optimistic concurrency — read first, then pass the sha back):
+14 tools (see `vaults/server.py` for exact descriptions). Read-only tools are
+marked **R**, mutating tools **M** (every note mutation honors `expected_sha256`
+for optimistic concurrency — read first, then pass the sha back; `delete_vault`
+is gated on `confirm` instead):
 
 | Tool | R/M | What it does |
 | ---- | --- | ------------ |
 | `list_vaults` | R | List all project vaults with note counts |
 | `server_info` | R | Server version, Python/platform, git + ripgrep availability, `git_enabled`, vaults root, vault count |
 | `create_vault` | M | Create a new vault (`created=False` when it already exists; idempotent) |
+| `delete_vault` | M | Delete a whole vault including git history (irreversible; `confirm` must equal the vault name) |
 | `list_notes` | R | List dirs/notes under a vault path (`recursive=True` for flat listing); paginated with `offset`/`limit` (default 200, max 500) → `total`, `truncated`, `next_offset` |
 | `read_note` | R | Read a note: frontmatter, content, wiki-links, backlinks, unresolved links |
 | `write_note` | M | Create or atomically overwrite a note (`expected_sha256` for optimistic concurrency) |
@@ -113,7 +115,8 @@ How the server avoids losing or corrupting notes:
   by the core library, not the tool boundary.
 - **Optimistic concurrency.** Every mutation (`write`/`append`/`move`/
   `delete`/`restore`) accepts `expected_sha256`; a stale sha is rejected
-  instead of clobbering someone else's edit.
+  instead of clobbering someone else's edit. `delete_vault` is instead gated
+  on `confirm` exactly equaling the vault name.
 - **Fail-open versioning.** The write itself is the source of truth — a
   missing git binary or failed commit warns (surfaced as `commit_error`)
   but never blocks the write.
@@ -181,7 +184,7 @@ versioning and its opt-out), and exits non-zero with a traceback on failure.
 ## Architecture (brief)
 
 ```
-opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 13 tools) <-> ~/.vaults/<project>/*.md
+opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 14 tools) <-> ~/.vaults/<project>/*.md
 ```
 
 - `vaults/` is the whole server: `config.py` (vaults root, logging, CLI),
@@ -190,7 +193,7 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 13 tools) <
   vault creation),
   `indexes.py` (in-memory backlink/frontmatter indexes with mtime-based
   invalidation), `search.py` (ripgrep + Python-fallback search),
-  `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 13
+  `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 14
   tools, stdio bridge). Root `server.py` is a thin shim so `python
   server.py` keeps working.
 - `server.py` keeps the event loop responsive: every tool runs its blocking

@@ -17,6 +17,7 @@ EXPECTED_TOOLS = [
     "append_note",
     "create_vault",
     "delete_note",
+    "delete_vault",
     "history",
     "list_notes",
     "list_tags",
@@ -44,6 +45,7 @@ DESTRUCTIVE_TOOLS = {
     "append_note",
     "move_note",
     "delete_note",
+    "delete_vault",
     "restore",
 }
 
@@ -122,6 +124,10 @@ async def main() -> int:
                 assert made_ann.destructiveHint is False, made_ann
                 assert made_ann.readOnlyHint is False, made_ann
                 assert made_ann.openWorldHint is False, made_ann
+                assert sorted(by_name["delete_vault"].inputSchema["required"]) == [
+                    "confirm",
+                    "vault",
+                ]
 
                 # JSON schema advertises the numeric bounds.
                 limit_schema = by_name["list_notes"].inputSchema["properties"]["limit"]
@@ -166,6 +172,109 @@ async def main() -> int:
                 assert bad_name.isError, "vault traversal was not rejected"
                 relisted = out(await session.call_tool("list_vaults", {}))
                 assert "Newvault" in {item["name"] for item in relisted}, relisted
+
+                # delete_vault: whole-tree removal gated on exact confirmation.
+                await session.call_tool("create_vault", {"vault": "Delvault"})
+                await session.call_tool(
+                    "write_note",
+                    {"vault": "Delvault", "path": "a.md", "content": "a\n"},
+                )
+                await session.call_tool(
+                    "write_note",
+                    {"vault": "Delvault", "path": "b.md", "content": "b\n"},
+                )
+                removed = out(
+                    await session.call_tool(
+                        "delete_vault", {"vault": "Delvault", "confirm": "Delvault"}
+                    )
+                )
+                assert removed["deleted"] is True, removed
+                assert removed["notes_removed"] == 2, removed
+                assert not (vaults / "Delvault").exists()
+                fresh_listed = out(await session.call_tool("list_vaults", {}))
+                assert "Delvault" not in {item["name"] for item in fresh_listed}
+
+                await session.call_tool("create_vault", {"vault": "Confirmvault"})
+                mismatch = await session.call_tool(
+                    "delete_vault", {"vault": "Confirmvault", "confirm": "wrong"}
+                )
+                assert mismatch.isError, "confirm mismatch was not rejected"
+                assert "confirm" in err_text(mismatch), err_text(mismatch)
+                assert (vaults / "Confirmvault").is_dir()
+                confirm_cleanup = out(
+                    await session.call_tool(
+                        "delete_vault",
+                        {"vault": "Confirmvault", "confirm": "Confirmvault"},
+                    )
+                )
+                assert confirm_cleanup["deleted"] is True, confirm_cleanup
+
+                traversal_del = await session.call_tool(
+                    "delete_vault", {"vault": "../evil", "confirm": "../evil"}
+                )
+                assert traversal_del.isError, "vault traversal was not rejected"
+                assert not (vaults / "evil").exists()
+
+                no_such = await session.call_tool(
+                    "delete_vault",
+                    {"vault": "NoSuchVault", "confirm": "NoSuchVault"},
+                )
+                assert no_such.isError, "missing vault was not rejected"
+                assert "unknown vault" in err_text(no_such), err_text(no_such)
+
+                near_miss = await session.call_tool(
+                    "delete_vault",
+                    {"vault": "Termchatt", "confirm": "Termchatt"},
+                )
+                assert near_miss.isError, "near-miss vault name was not rejected"
+                assert "did you mean" in err_text(near_miss), err_text(near_miss)
+                assert (vaults / "Termchat").is_dir(), "near-miss delete touched a real vault"
+
+                outer = Path(tempfile.mkdtemp(prefix="vaults-hub-outer-"))
+                (outer / "sentinel.txt").write_text("keep\n", encoding="utf-8")
+                os.symlink(outer, vaults / "Aliasvault")
+                alias_del = await session.call_tool(
+                    "delete_vault",
+                    {"vault": "Aliasvault", "confirm": "Aliasvault"},
+                )
+                assert alias_del.isError, "symlink alias was not rejected"
+                assert (vaults / "Aliasvault").is_symlink(), "alias symlink was followed"
+                assert (outer / "sentinel.txt").is_file(), "symlink target was harmed"
+                (vaults / "Aliasvault").unlink()
+                (outer / "sentinel.txt").unlink()
+                outer.rmdir()
+
+                recreated = out(await session.call_tool("create_vault", {"vault": "Delvault"}))
+                assert recreated["created"] is True, recreated
+                relisted_after = out(await session.call_tool("list_vaults", {}))
+                assert {item["name"]: item["notes"] for item in relisted_after}["Delvault"] == 0, (
+                    relisted_after
+                )
+
+                await session.call_tool("create_vault", {"vault": "Gitvault"})
+                await session.call_tool(
+                    "write_note",
+                    {"vault": "Gitvault", "path": "a.md", "content": "hi\n"},
+                )
+                had_git = (vaults / "Gitvault" / ".git").is_dir()
+                git_del = out(
+                    await session.call_tool(
+                        "delete_vault", {"vault": "Gitvault", "confirm": "Gitvault"}
+                    )
+                )
+                if had_git:
+                    assert git_del["git_history"] == "removed", git_del
+                    assert not (vaults / "Gitvault" / ".git").exists()
+                else:
+                    assert git_del["git_history"] == "none", git_del
+                await session.call_tool("create_vault", {"vault": "Emptyvault"})
+                empty_del = out(
+                    await session.call_tool(
+                        "delete_vault",
+                        {"vault": "Emptyvault", "confirm": "Emptyvault"},
+                    )
+                )
+                assert empty_del["git_history"] == "none", empty_del
 
                 # Unknown vault names get a client-safe error with valid choices.
                 unknown = await session.call_tool("read_note", {"vault": "Termcha", "path": "x.md"})
