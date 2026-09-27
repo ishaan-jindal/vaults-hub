@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
   lazy `git init` on first mutation, path-scoped commits with `Sha256:`
   trailers, new `history` and `restore` tools. Local-only, never pushes.
 - Vaults root (`~/.vaults` default) is auto-created on startup when missing.
+- Every tool now declares all four MCP annotation hints explicitly
+  (readOnlyHint/destructiveHint/idempotentHint/openWorldHint).
 
 ## [0.1.0] - 2026-09-24
 

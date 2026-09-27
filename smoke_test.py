@@ -101,13 +101,27 @@ async def main() -> int:
                     assert by_name[name].annotations is not None, name
                     assert by_name[name].annotations.title, name
                     assert by_name[name].annotations.openWorldHint is False, name
+                    for hint in (
+                        by_name[name].annotations.readOnlyHint,
+                        by_name[name].annotations.destructiveHint,
+                        by_name[name].annotations.idempotentHint,
+                        by_name[name].annotations.openWorldHint,
+                    ):
+                        assert hint is not None, name
+                        assert isinstance(hint, bool), name
                 for name in READ_ONLY_TOOLS:
                     assert by_name[name].annotations.readOnlyHint is True, name
+                    assert by_name[name].annotations.destructiveHint is False, name
+                    assert by_name[name].annotations.idempotentHint is True, name
                 for name in DESTRUCTIVE_TOOLS:
                     assert by_name[name].annotations.destructiveHint is True, name
+                    assert by_name[name].annotations.readOnlyHint is False, name
+                    assert by_name[name].annotations.idempotentHint is False, name
                 made_ann = by_name["create_vault"].annotations
                 assert made_ann.idempotentHint is True, made_ann
                 assert made_ann.destructiveHint is False, made_ann
+                assert made_ann.readOnlyHint is False, made_ann
+                assert made_ann.openWorldHint is False, made_ann
 
                 # JSON schema advertises the numeric bounds.
                 limit_schema = by_name["list_notes"].inputSchema["properties"]["limit"]

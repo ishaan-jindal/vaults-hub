@@ -87,7 +87,13 @@ async def _run_off_loop(tool_name: str, fn: Callable, /, *args: Any, **kwargs: A
 
 @mcp.tool(
     description="List all project vaults with their note counts.",
-    annotations=ToolAnnotations(title="List vaults", readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        title="List vaults",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def list_vaults() -> list[dict]:
     return await _run_off_loop(
@@ -116,7 +122,13 @@ async def create_vault(vault: Annotated[str, Field(description="Vault name")]) -
     "'' for root). Pass recursive=True to list all descendant notes flat (dirs=[]). "
     "Paginate with offset/limit (default limit 200, max 500); the response carries "
     "total (full match count), truncated, and next_offset (None when done).",
-    annotations=ToolAnnotations(title="List notes", readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        title="List notes",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def list_notes(
     vault: Annotated[str, Field(description="Vault name")],
@@ -141,7 +153,13 @@ async def list_notes(
 
 @mcp.tool(
     description="Read a note: frontmatter, content, wiki-links, backlinks, unresolved links.",
-    annotations=ToolAnnotations(title="Read note", readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        title="Read note",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def read_note(
     vault: Annotated[str, Field(description="Vault name")],
@@ -281,7 +299,13 @@ async def move_note(
         "commits exist beyond limit (clamped 1-200). An untracked path returns "
         "an empty list with untracked:true."
     ),
-    annotations=ToolAnnotations(title="Note history", readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        title="Note history",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def history(
     vault: Annotated[str, Field(description="Vault name")],
@@ -331,7 +355,13 @@ async def restore(
         "List tag counts per vault from cached frontmatter. "
         "Pass vault for one vault, or omit for all vaults."
     ),
-    annotations=ToolAnnotations(title="List tags", readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        title="List tags",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def list_tags(
     vault: Annotated[str | None, Field(description="Vault name; omit for all vaults")] = None,
@@ -347,7 +377,13 @@ async def list_tags(
         "text (= match_line) plus before_lines/match_line/after_lines, "
         "otherwise only text."
     ),
-    annotations=ToolAnnotations(title="Search notes", readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        title="Search notes",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def search_notes(
     query: Annotated[str, Field(description="Search text (or regex with regex=True)")],
@@ -378,7 +414,13 @@ async def search_notes(
         "the vault count. This is a local stdio server; the vaults root path "
         "is intentionally exposed."
     ),
-    annotations=ToolAnnotations(title="Server info", readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        title="Server info",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def server_info() -> dict:
     return await _run_off_loop("server_info", _collect_server_info)
