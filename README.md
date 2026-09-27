@@ -1,6 +1,6 @@
 # vaults-hub
 
-[![M8ven Score](https://m8ven.ai/badge/mcp/ishaan-jindal/vaults-hub)](https://m8ven.ai/mcp/ishaan-jindal/vaults-hub)
+[![M8ven Score](https://m8ven.ai/badge/mcp/ishaan-jindal-vaults-hub-zaplmq?v=2bb4b0f0fe2d184af866aa4d8a981d7a)](https://m8ven.ai/mcp/ishaan-jindal-vaults-hub-zaplmq)
 
 A Python [MCP](https://modelcontextprotocol.io) server that exposes your
 [Obsidian](https://obsidian.md)-style Markdown vaults to MCP clients (e.g. OpenCode).
