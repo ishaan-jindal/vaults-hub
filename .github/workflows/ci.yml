@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege by default; each job declares exactly what it needs.
+permissions: {}
+
+# Safe for CI: a superseded run never publishes anything, so kill it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Install ruff
+        # Pinned so a future ruff release cannot change defaults and turn CI red.
+        run: pip install ruff==0.15.22
+      - name: Ruff lint
+        run: ruff check vaults server.py smoke_test.py
+      - name: Ruff format check
+        run: ruff format --check vaults server.py smoke_test.py
+      - name: Smoke test
+        run: python smoke_test.py
+
+  # Independent of `python` on purpose: a Python failure must still surface
+  # the npm results in the same run.
+  npm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Install Python dependencies
+        # The launcher test points VAULTS_HUB_PYTHON at this interpreter, so it
+        # exercises the fast path and needs no network for a venv bootstrap.
+        run: python3 -m pip install -r requirements.txt
+      - name: Syntax-check launcher
+        run: node --check bin/vaults-hub.mjs
+      - name: Assert tarball file list
+        run: |
+          set -euo pipefail
+          # The dry-run must succeed; the authoritative assertion below runs
+          # against a real tarball because `npm pack --dry-run` omits the
+          # `package/` prefix on some npm versions while `tar -tzf` always
+          # carries it.
+          npm pack --dry-run 2>&1 | tee pack-dry-run.log
+          PACK_TMP="$(mktemp -d)"
+          trap 'rm -rf "$PACK_TMP"' EXIT
+          npm pack --pack-destination "$PACK_TMP" > pack-name.txt
+          cat pack-name.txt
+          TARBALL="$PACK_TMP/$(cat pack-name.txt)"
+          tar -tzf "$TARBALL" | sort > pack-files.txt
+          cat pack-files.txt
+          fail() {
+            echo "::error::$1" >&2
+            echo "--- actual tarball contents ---" >&2
+            cat pack-files.txt >&2
+            exit 1
+          }
+          for f in \
+            "package/bin/vaults-hub.mjs" \
+            "package/server.py" \
+            "package/requirements.txt" \
+            "package/vaults/__init__.py" \
+            "package/vaults/config.py" \
+            "package/vaults/indexes.py" \
+            "package/vaults/notes.py" \
+            "package/vaults/search.py" \
+            "package/vaults/server.py" \
+            "package/vaults/versioning.py" \
+            "package/README.md" \
+            "package/LICENSE" \
+            "package/package.json"; do
+            grep -qxF "$f" pack-files.txt || fail "tarball missing expected file: $f"
+          done
+          if grep -q "smoke_test.py" pack-files.txt; then
+            fail "tarball must not contain smoke_test.py"
+          fi
+          if grep -q "__pycache__" pack-files.txt; then
+            fail "tarball must not contain __pycache__"
+          fi
+          if grep -qE '(^|/)\.' pack-files.txt; then
+            fail "tarball must not contain dotfiles"
+          fi
+          echo "tarball file list OK"
+      - name: Launcher integration test
+        run: python3 npm_launcher_test.py

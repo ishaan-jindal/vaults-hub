@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+# The `npm` ecosystem is deliberately omitted: package.json has zero
+# dependencies and there is no lockfile, so an npm updater could never open
+# a meaningful PR.

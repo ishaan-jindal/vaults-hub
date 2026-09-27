@@ -1,0 +1,192 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+# Least privilege by default; each job declares exactly what it needs.
+permissions: {}
+
+# Never cancel a release: an interrupted publish can leave a tag, dist-tag,
+# or GitHub Release inconsistent, so superseded runs must queue.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Smoke test
+        run: python smoke_test.py
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Syntax-check launcher
+        run: node --check bin/vaults-hub.mjs
+      # A release must not be able to ship a broken package: same file-list
+      # assertion as CI, against a real tarball (see ci.yml for why tar, not
+      # just `npm pack --dry-run`, is authoritative here).
+      - name: Assert tarball file list
+        run: |
+          set -euo pipefail
+          npm pack --dry-run 2>&1 | tee pack-dry-run.log
+          PACK_TMP="$(mktemp -d)"
+          trap 'rm -rf "$PACK_TMP"' EXIT
+          npm pack --pack-destination "$PACK_TMP" > pack-name.txt
+          cat pack-name.txt
+          TARBALL="$PACK_TMP/$(cat pack-name.txt)"
+          tar -tzf "$TARBALL" | sort > pack-files.txt
+          cat pack-files.txt
+          fail() {
+            echo "::error::$1" >&2
+            echo "--- actual tarball contents ---" >&2
+            cat pack-files.txt >&2
+            exit 1
+          }
+          for f in \
+            "package/bin/vaults-hub.mjs" \
+            "package/server.py" \
+            "package/requirements.txt" \
+            "package/vaults/__init__.py" \
+            "package/vaults/config.py" \
+            "package/vaults/indexes.py" \
+            "package/vaults/notes.py" \
+            "package/vaults/search.py" \
+            "package/vaults/server.py" \
+            "package/vaults/versioning.py" \
+            "package/README.md" \
+            "package/LICENSE" \
+            "package/package.json"; do
+            grep -qxF "$f" pack-files.txt || fail "tarball missing expected file: $f"
+          done
+          if grep -q "smoke_test.py" pack-files.txt; then
+            fail "tarball must not contain smoke_test.py"
+          fi
+          if grep -q "__pycache__" pack-files.txt; then
+            fail "tarball must not contain __pycache__"
+          fi
+          if grep -qE '(^|/)\.' pack-files.txt; then
+            fail "tarball must not contain dotfiles"
+          fi
+          echo "tarball file list OK"
+
+  publish:
+    needs: verify
+    # A workflow_dispatch runs against a branch and must NOT publish.
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # id-token: write mints the OIDC token for npm trusted publishing.
+      # It belongs on this job only, nowhere else.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Version guard
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME disagrees with package.json version $PKG_VERSION" >&2
+            exit 1
+          fi
+          echo "version guard OK: $PKG_VERSION"
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          # Release jobs must not restore caches: cache poisoning is the
+          # documented risk to OIDC token exposure.
+          package-manager-cache: false
+      # ------------------------------------------------------------------
+      # First-publish limitation: npm's OIDC trusted publishing cannot create
+      # a brand-new package name, because the Trusted Publisher config lives
+      # on the package's npm settings page, which does not exist until the
+      # package does. So 0.2.0 is published manually once from a laptop with
+      # `npm publish`; then the Trusted Publisher is configured on npmjs.com
+      # (user `ishaan-jindal`, repo `vaults-hub`, workflow filename
+      # `release.yml`, environment blank). From 0.3.0 on this workflow works
+      # unchanged. The npm-side fields are case-sensitive and validated only
+      # at publish time, where a mismatch surfaces as a confusing E404 rather
+      # than an auth error. There is deliberately no token-based fallback here.
+      # ------------------------------------------------------------------
+      - name: Publish to npm
+        # Provenance is automatic under trusted publishing from a public repo
+        # plus a public package, so no --provenance flag and no NODE_AUTH_TOKEN.
+        #
+        # Bootstrap case: 0.2.0 must be published by hand before the tag is
+        # pushed, so re-publishing it here fails with EPUBLISHCONFLICT. An
+        # exact version already sitting on the registry is the desired end
+        # state, not a failure -- treat it as success so the run stays green
+        # and the GitHub Release step still runs.
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if npm publish; then
+            echo "published v${PKG_VERSION}"
+          elif npm view "vaults-hub@${PKG_VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::v${PKG_VERSION} is already on the registry; treating as published"
+          else
+            echo "::error::npm publish failed and v${PKG_VERSION} is not on the registry"
+            exit 1
+          fi
+
+  release:
+    needs: publish
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # `gh` is preinstalled on GitHub-hosted runners, which is why no
+      # third-party release action is used here.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::no CHANGELOG entry found for version $VERSION" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md
