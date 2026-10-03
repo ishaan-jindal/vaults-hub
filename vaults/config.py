@@ -14,18 +14,22 @@ _logger = logging.getLogger("vaults")
 
 
 def _setup_logging() -> None:
-    """Enable debug file logging when VAULTS_HUB_DEBUG=1. No-op otherwise."""
-    if os.environ.get("VAULTS_HUB_DEBUG") != "1":
-        _logger.disabled = True
-        return
+    """Always log errors to the debug file; VAULTS_HUB_DEBUG=1 adds verbose logging."""
+    # The server tells users to check this log on unexpected failures, so it must always exist.
     _logger.disabled = False
+    _logger.propagate = False
+    if os.environ.get("VAULTS_HUB_DEBUG") == "1":
+        _logger.setLevel(logging.DEBUG)
+    else:
+        _logger.setLevel(logging.WARNING)
+    if _logger.handlers:
+        return
     try:
         log_dir = Path.home() / ".cache" / "vaults-hub"
         log_dir.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(log_dir / "debug.log", maxBytes=1_000_000, backupCount=3)
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
         _logger.addHandler(handler)
-        _logger.setLevel(logging.DEBUG)
     except OSError:
         pass
 
