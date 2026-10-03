@@ -108,8 +108,9 @@ With the server registered as `vaults`:
 ## Tools
 
 14 tools (see `vaults/server.py` for exact descriptions). Read-only tools are
-marked **R**, mutating tools **M** (every note mutation honors `expected_sha256`
-for optimistic concurrency — read first, then pass the sha back; `delete_vault`
+marked **R**, mutating tools **M** (`write_note`/`append_note`/`move_note`/`restore`
+honor `expected_sha256` for optimistic concurrency — read first, then pass the
+sha back; `delete_note` has no sha guard and `delete_vault`
 is gated on `confirm` instead):
 
 | Tool | R/M | What it does |
@@ -167,9 +168,9 @@ How the server avoids losing or corrupting notes:
   so concurrent writes and restores cannot deadlock. Read-only `history`
   takes no locks and never blocks writers; truncation flags are computed
   by the core library, not the tool boundary.
-- **Optimistic concurrency.** Every mutation (`write`/`append`/`move`/
-  `delete`/`restore`) accepts `expected_sha256`; a stale sha is rejected
-  instead of clobbering someone else's edit. `delete_vault` is instead gated
+- **Optimistic concurrency.** `write`/`append`/`move`/`restore` accept
+  `expected_sha256`; a stale sha is rejected instead of clobbering someone
+  else's edit. `delete_note` has no sha guard; `delete_vault` is instead gated
   on `confirm` exactly equaling the vault name.
 - **Fail-open versioning.** The write itself is the source of truth — a
   missing git binary or failed commit warns (surfaced as `commit_error`)
@@ -267,7 +268,7 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 14 tools) <
 ## Limitations
 
 - **Private SDK pin:** dependencies are pinned in `requirements.txt`
-  (`anyio==4.9.0`, `mcp==1.30.0`, `PyYAML==6.0.3`); bump deliberately and re-run `python smoke_test.py`.
+  (`anyio==4.15.1`, `mcp==1.30.0`, `PyYAML==6.0.3`); bump deliberately and re-run `python smoke_test.py`.
 - **Move is copy + delete, not one atomic rename:** `move_note` writes the
   destination atomically, then unlinks the source — a crash between the two
   steps can leave both copies behind. A failed move cleans up the partial
