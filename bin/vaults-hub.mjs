@@ -28,7 +28,60 @@ const SERVER_PY = join(PACKAGE_ROOT, "server.py");
 const REQUIREMENTS_TXT = join(PACKAGE_ROOT, "requirements.txt");
 
 const MIN_PYTHON = [3, 10];
-const DEPS_PROBE = "import mcp, anyio, yaml";
+// Distribution -> importable module for the pinned requirements. Versions
+// are NOT pinned here: requirements.txt is the single source of truth
+// (parsed below), so bumping a pin there flows into the probe on both the
+// fast path and the post-install verify. This map only records names, and
+// stays correct for future pins via the normalized fallback in buildProbe.
+const IMPORT_BY_DIST = { PyYAML: "yaml", anyio: "anyio", mcp: "mcp" };
+
+// Parse only real `name==version` pins from requirements.txt; ignore blank
+// lines, comments, and anything without `==`. Distribution names are kept
+// verbatim: importlib.metadata normalizes them (PyYAML works as-is).
+function parseRequirementPins() {
+  let text;
+  try {
+    text = readFileSync(REQUIREMENTS_TXT, "utf8");
+  } catch (e) {
+    err(`cannot read requirements.txt at ${REQUIREMENTS_TXT}: ${e.message}`);
+    process.exit(1);
+  }
+  const pins = [];
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("==");
+    if (eq < 0) continue;
+    const name = line.slice(0, eq).trim();
+    const version = line.slice(eq + 2).trim().split(/[\s;#]/)[0];
+    if (!name || !version) continue;
+    pins.push([name, version]);
+  }
+  return pins;
+}
+
+// Build the `python -c` probe from parsed pins. Explicit `raise SystemExit`
+// checks (never `assert`) so `python -O` cannot strip the guard; the
+// trailing import proves the modules actually import, not just their
+// metadata. Statements are newline-joined: `if` is a compound statement and
+// cannot follow `;` in a `python -c` one-liner.
+function buildProbe(pins) {
+  const lines = ["import importlib.metadata as _m"];
+  for (const [name, version] of pins) {
+    lines.push(
+      `if _m.version('${name}')!='${version}': raise SystemExit('${name}==${version} required')`
+    );
+  }
+  const imports = pins.map(
+    ([name]) => IMPORT_BY_DIST[name] ?? name.toLowerCase().replace(/-/g, "_")
+  );
+  lines.push(`import ${imports.join(", ")}`);
+  return lines.join("\n");
+}
+
+function depsProbe() {
+  return buildProbe(parseRequirementPins());
+}
 
 function err(msg) {
   process.stderr.write(`vaults-hub: ${msg}\n`);
@@ -86,8 +139,12 @@ function resolvePython() {
   process.exit(1);
 }
 
+function probeDeps(pythonCmd) {
+  return runCapture(pythonCmd, ["-c", depsProbe()]);
+}
+
 function depsImportable(pythonCmd) {
-  return runCapture(pythonCmd, ["-c", DEPS_PROBE]).ok;
+  return probeDeps(pythonCmd).ok;
 }
 
 // Cache root for bootstrapped venvs. XDG_CACHE_HOME wins when set,
@@ -106,7 +163,12 @@ function sha256File(path) {
 // when the system interpreter lacks them. Returns the interpreter to spawn.
 function ensureInterpreter(py) {
   // Fast path: system interpreter already has everything. Zero side effects.
-  if (depsImportable(py.cmd)) return py.cmd;
+  // On mismatch, surface the probe's own diagnostic (which pin differed)
+  // before the generic bootstrap message below.
+  const fast = probeDeps(py.cmd);
+  if (fast.ok) return py.cmd;
+  const fastDetail = (fast.stderr || fast.stdout).trim().split("\n").pop().trim();
+  if (fastDetail) err(fastDetail);
 
   // Bootstrap path: reuse or rebuild a cached venv for this minor version.
   const root = cacheRoot();
@@ -169,7 +231,7 @@ function ensureInterpreter(py) {
     if (pipRes.spawnError) err(String(pipRes.spawnError.message ?? pipRes.spawnError));
     process.exit(1);
   }
-  const verify = runCapture(venvPy, ["-c", DEPS_PROBE]);
+  const verify = runCapture(venvPy, ["-c", depsProbe()]);
   if (!verify.ok) {
     err(`venv python at ${venvPy} still cannot import the dependencies.`);
     const detail = (verify.stderr || verify.stdout).trim();

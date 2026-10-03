@@ -9,6 +9,7 @@ Python suite.
 import ast
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -63,6 +64,146 @@ def protocol_version() -> str:
         return "2025-06-18"
 
 
+def parse_requirements_txt(path: Path) -> dict[str, str]:
+    """Parse only real `name==version` pins; ignore blanks, comments, non-== lines."""
+    pins: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "==" not in line:
+            continue
+        name, _, rest = line.partition("==")
+        version = re.split(r"[\s;#]", rest.strip(), maxsplit=1)[0]
+        if name.strip() and version:
+            pins[name.strip()] = version
+    return pins
+
+
+def generated_probe(launcher_path: Path, requirements_path: Path) -> str | None:
+    """Execute the launcher's real probe builder against the given files.
+
+    Copies both into a temp package layout (bin/vaults-hub.mjs plus
+    requirements.txt) so the launcher's import.meta.url self-location keeps
+    working, neutralizes the entrypoint to print the probe instead of
+    starting the server, and runs it. Returns None when node is missing.
+    """
+    if shutil.which("node") is None:
+        return None
+    src = launcher_path.read_text(encoding="utf-8")
+    assert "function depsProbe()" in src, f"{launcher_path} must expose depsProbe()"
+    assert src.count("main();") == 1, f"{launcher_path} entrypoint changed; update the guard"
+    harness = src.replace("main();", "console.log(depsProbe());")
+    with tempfile.TemporaryDirectory(prefix="vaults-hub-probe-") as pkg:
+        pkg_path = Path(pkg)
+        (pkg_path / "bin").mkdir()
+        (pkg_path / "bin" / "vaults-hub.mjs").write_text(harness, encoding="utf-8")
+        shutil.copy(requirements_path, pkg_path / "requirements.txt")
+        proc = subprocess.run(
+            ["node", str(pkg_path / "bin" / "vaults-hub.mjs")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    assert proc.returncode == 0, f"probe builder failed: {proc.stderr.strip()}"
+    probe = proc.stdout.strip()
+    assert probe, "probe builder printed nothing"
+    # The probe must be valid Python in its own right (compound `if`
+    # statements cannot follow `;` in `python -c`; compile catches that
+    # without needing the dependencies installed).
+    compile_proc = subprocess.run(
+        [sys.executable, "-c", "import sys; compile(sys.stdin.read(), '<probe>', 'exec')"],
+        input=probe,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert compile_proc.returncode == 0, (
+        f"generated probe does not compile: {compile_proc.stderr.strip()}"
+    )
+    return probe
+
+
+def check_launcher_probe_pins(
+    launcher_path: Path | None = None,
+    requirements_path: Path | None = None,
+) -> None:
+    """Guard: the launcher probe must derive from requirements.txt.
+
+    Fails loudly if the launcher carries a stale hardcoded copy of the pins,
+    if the version checks could be stripped (bare assert), or if the probe
+    degrades to a mere importability test. Paths are parameterized so a
+    scratch copy with corrupted pins can be shown to fail.
+    """
+    launcher_path = launcher_path or HERE / "bin" / "vaults-hub.mjs"
+    requirements_path = requirements_path or HERE / "requirements.txt"
+    wanted = parse_requirements_txt(requirements_path)
+    assert wanted, f"no name==version pins parsed from {requirements_path}"
+    text = launcher_path.read_text(encoding="utf-8")
+
+    # No stale second copy: any hardcoded triple naming a pinned
+    # distribution must agree with requirements.txt. (Template placeholders
+    # like ${name} are builder code, not pins, so they are skipped.)
+    hardcoded: dict[str, str] = {}
+    for m in re.finditer(
+        r"version\(\s*['\"]([^'\"]+)['\"]\s*\)\s*(?:==|!=)\s*['\"]([^'\"]+)['\"]", text
+    ):
+        if "$" not in m.group(1) and "$" not in m.group(2):
+            hardcoded[m.group(1)] = m.group(2)
+    for m in re.finditer(r"['\"]([A-Za-z0-9_.\-]+)==([A-Za-z0-9_.\-]+)['\"]", text):
+        if "$" not in m.group(0):
+            hardcoded.setdefault(m.group(1), m.group(2))
+    for name, version in hardcoded.items():
+        key = next((k for k in wanted if k.lower() == name.lower()), None)
+        if key is None:
+            continue
+        assert version == wanted[key], (
+            f"launcher carries a stale pin {name}=={version} "
+            f"but requirements.txt has {key}=={wanted[key]}; "
+            "the probe must be derived from requirements.txt, not hardcoded"
+        )
+
+    # Derived, not hardcoded: the probe reads REQUIREMENTS_TXT at runtime.
+    assert "REQUIREMENTS_TXT" in text, "launcher probe must read REQUIREMENTS_TXT"
+    assert "readFileSync(REQUIREMENTS_TXT" in text, (
+        "launcher probe must parse REQUIREMENTS_TXT instead of hardcoding versions"
+    )
+    # Version checks, not a bare importability test — and explicit raises,
+    # never `assert` (assert is stripped under python -O).
+    assert "importlib.metadata" in text, "launcher probe must check versions via importlib.metadata"
+    assert re.search(r"\.version\(", text), "launcher probe must call importlib.metadata.version()"
+    assert "SystemExit" in text, "launcher probe must raise explicitly (assert is stripped by -O)"
+    assert "assert _m.version" not in text, (
+        "launcher probe must not use bare assert (stripped under python -O)"
+    )
+    assert re.search(r"import \$\{imports", text), (
+        "launcher probe must still verify the modules actually import"
+    )
+    # Every pinned distribution (or its import name) is known to the probe.
+    import_by_dist = {"PyYAML": "yaml"}
+    for name in wanted:
+        import_name = import_by_dist.get(name, name.lower().replace("-", "_"))
+        assert name in text or import_name in text, (
+            f"launcher probe never mentions requirement {name!r}; "
+            "a bare `import ...` probe cannot catch version skew"
+        )
+
+    # Runtime leg: run the launcher's real builder and check the generated
+    # probe pins every requirement (skipped only when node is missing).
+    probe = generated_probe(launcher_path, requirements_path)
+    if probe is None:
+        print("SKIP: node not found; static probe-pin guard only")
+        return
+    assert "assert" not in probe, f"generated probe must not rely on assert: {probe!r}"
+    for name, version in wanted.items():
+        assert name in probe, f"generated probe never checks {name!r}: {probe!r}"
+        assert version in probe, (
+            f"generated probe never checks version {version!r} for {name!r}: {probe!r}"
+        )
+    pins = ", ".join(f"{k}=={v}" for k, v in sorted(wanted.items()))
+    print(f"launcher probe pins OK ({pins})")
+
+
 def send(proc: subprocess.Popen, obj: dict) -> None:
     assert proc.stdin is not None
     proc.stdin.write(json.dumps(obj) + "\n")
@@ -82,6 +223,11 @@ def recv(proc: subprocess.Popen, stdout_lines: list[str], timeout: float = 30.0)
 
 
 def main() -> int:
+    # Static + runtime guard (fast, no network): the probe must derive from
+    # requirements.txt. Runs before the npm/node checks so a stale pin fails
+    # loudly even when the integration leg would skip.
+    check_launcher_probe_pins()
+
     npm = shutil.which("npm")
     if npm is None:
         print("SKIP: npm not found on PATH; install Node to run the launcher test")
