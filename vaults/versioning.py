@@ -27,6 +27,18 @@ _GIT_EXCLUDES = [".obsidian/", ".*.lock", ".*.tmp"]
 # vault name -> "ours" | "external" | "disabled" (process-local cache).
 _GIT_MODE: dict[str, str] = {}
 
+
+def _pathspec(rel: str) -> str:
+    """Force git to read `rel` as a literal path.
+
+    WHY: git reads these arguments as PATHSPECS, so a note named `:(glob)*.md`
+    would otherwise be expanded by git and sweep unrelated notes into the same
+    commit. `:(literal)` disables all magic. `:(literal)` is also the documented
+    way to pass a path that genuinely begins with `:`.
+    """
+    return f":(literal){rel}"
+
+
 # Read-only git subcommands get a shorter timeout and GIT_OPTIONAL_LOCKS=0.
 _READONLY_CMDS = frozenset({"rev-parse", "log", "ls-files", "show", "status"})
 
@@ -162,16 +174,17 @@ def _git_commit(root: Path, rels: list[str], subject: str, sha_hex: str | None) 
 
 def _git_commit_once(root: Path, rels: list[str], subject: str, sha_hex: str | None) -> str | None:
     """Single add/status/commit attempt. Callers must hold _git_lock(root)."""
-    add = _git_run(root, "add", "--", *rels)
+    specs = [_pathspec(r) for r in rels]
+    add = _git_run(root, "add", "--", *specs)
     if add.returncode != 0:
         return add.stderr.decode("utf-8", errors="replace").strip()[:300]
-    status = _git_run(root, "status", "--porcelain", "--", *rels)
+    status = _git_run(root, "status", "--porcelain", "--", *specs)
     if status.returncode != 0:
         return status.stderr.decode("utf-8", errors="replace").strip()[:300] or "git status failed"
     if not status.stdout.strip():
         return None
     msg = subject if sha_hex is None else f"{subject}\n\nSha256: {sha_hex}"
-    commit = _git_run(root, "commit", "--only", "-m", msg, "--", *rels)
+    commit = _git_run(root, "commit", "--only", "-m", msg, "--", *specs)
     if commit.returncode != 0:
         err = (
             commit.stderr.decode("utf-8", errors="replace")
@@ -206,7 +219,7 @@ def _git_result(root: Path, vault: str, rels: list[str], subject: str, sha_hex: 
 
 def _git_tracked(root: Path, rel: str) -> bool:
     """True if rel is in the vault repo index. Call only when mode is 'ours'."""
-    return _git_run(root, "ls-files", "--error-unmatch", "--", rel).returncode == 0
+    return _git_run(root, "ls-files", "--error-unmatch", "--", _pathspec(rel)).returncode == 0
 
 
 def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | None) -> str | None:
@@ -253,15 +266,21 @@ def _git_mode_error(mode: str) -> str:
 def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
     limit = max(1, min(200, int(limit)))
     root = _vault_root(vault)
+    rel: str | None = None
+    spec: str | None = None
     if path is not None:
-        _note_path(root, path)  # validate: stays inside the vault
+        rel = _rel(root, _note_path(root, path))  # validate: stays inside the vault
+        # WHY :(literal): rel is containment-checked but git also reads it as a
+        # pathspec, so a caller string like ":(glob)**/*.md" would otherwise be
+        # re-interpreted as magic and retarget the log. See _pathspec.
+        spec = _pathspec(rel)
     # Read-only: no locks taken, so history never blocks writers. The git
     # calls run with GIT_OPTIONAL_LOCKS=0 (see _git_run); a concurrent
     # commit may make the read fail, surfaced as ValueError below.
     mode = _git_read_mode(root, vault)
     if mode in ("disabled", "missing", "external"):
         raise ValueError(_git_mode_error(mode))
-    if path is not None and (mode == "none" or not _git_tracked(root, path)):
+    if rel is not None and (mode == "none" or not _git_tracked(root, rel)):
         return {
             "vault": vault,
             "path": path,
@@ -272,8 +291,8 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
         }
     # limit+1 probe so the core owns the truncated contract directly.
     args = ["log", "--no-decorate", f"--max-count={limit + 1}", "--pretty=format:%H%x00%aI%x00%s"]
-    if path is not None:
-        args += ["--follow", "--", path]
+    if rel is not None:
+        args += ["--follow", "--", spec]
     proc = _git_run(root, *args)
     if proc.returncode != 0:
         raise ValueError(
@@ -311,6 +330,8 @@ def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None)
     rev = rev.strip()
     if re.search(r"[\x00-\x1f\x7f]", rev):
         raise ValueError(f"invalid rev: {rev!r}")
+    if rev.startswith("-") or ":" in rev:
+        raise ValueError(f"invalid rev: {rev!r}")
     # Consistent note -> git lock order everywhere: the note lock is held
     # for the whole restore (it is the OCC guard) and the git lock is taken
     # inside it only around the two short git-mutating commits. Read-only
@@ -333,7 +354,7 @@ def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None)
                 "note has changed since the supplied expected_sha256;"
                 " read it again before restoring"
             )
-        status = _git_run(root, "status", "--porcelain", "--", rel)
+        status = _git_run(root, "status", "--porcelain", "--", _pathspec(rel))
         if status.returncode == 0 and status.stdout.strip():
             with _git_lock(root):
                 snap_err = _git_commit(root, [rel], "vaults: snapshot before restore", current_sha)

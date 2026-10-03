@@ -66,8 +66,16 @@ def _note_path(root: Path, rel: str) -> Path:
     return p
 
 
+def _sha256_bytes(data: bytes) -> str:
+    # WHY: sha256 is defined over the exact bytes on disk so read/restore/
+    # delete/move agree even for non-UTF-8 files whose lossy errors="replace"
+    # decode would otherwise hash different bytes than what is stored.
+    return hashlib.sha256(data).hexdigest()
+
+
 def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    """Hash content being written; its UTF-8 encoding is exactly what lands on disk."""
+    return _sha256_bytes(text.encode("utf-8"))
 
 
 def _ensure_utf8(content: str) -> None:
@@ -80,12 +88,25 @@ def _ensure_utf8(content: str) -> None:
         raise ValueError("note content must be valid UTF-8") from exc
 
 
+def _read_note(path: Path) -> tuple[bytes, str]:
+    """Read a note once as (raw bytes, text).
+
+    WHY two values: sha256 is hashed from the raw bytes, while text keeps the
+    universal-newline normalization read_text() always applied. Deriving both
+    from a single read is what keeps a returned sha and a returned content
+    describing the same file, and stops one code path normalizing CRLF while
+    another does not.
+    """
+    raw = path.read_bytes()
+    text = raw.decode("utf-8", errors="replace")
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return raw, text
+
+
 def _read_text(path: Path) -> str:
     """Read a note as UTF-8, replacing invalid bytes instead of crashing."""
-    try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return path.read_bytes().decode("utf-8", errors="replace")
+    return _read_note(path)[1]
 
 
 @contextlib.contextmanager
@@ -478,7 +499,7 @@ def read_note(vault: str, path: str) -> dict:
     if not p.is_file():
         raise ValueError(f"note not found: {path!r}")
     _ensure_indexes(root, vault)
-    text = _read_text(p)
+    raw, text = _read_note(p)
     rel = _rel(root, p)
     cached_fm = _FRONTMATTER_INDEX.get(vault, {}).get(rel)
     if cached_fm is None:
@@ -497,7 +518,7 @@ def read_note(vault: str, path: str) -> dict:
         "path": rel,
         "frontmatter": frontmatter,
         "content": text,
-        "sha256": _sha256(text),
+        "sha256": _sha256_bytes(raw),
         "links": links,
         "backlinks": backlinks,
         "unresolved_links": unresolved,
@@ -517,18 +538,19 @@ def _write_note_locked(
         raise ValueError(f"note path is a directory: {p.name!r}")
     _ensure_utf8(content)
     p.parent.mkdir(parents=True, exist_ok=True)
-    previous = _read_text(p) if p.is_file() else None
-    previous_sha256 = _sha256(previous) if previous is not None else None
+    previous_raw = p.read_bytes() if p.is_file() else None
+    previous_sha256 = _sha256_bytes(previous_raw) if previous_raw is not None else None
     if expected_sha256 is not None and expected_sha256 != previous_sha256:
         raise ValueError(
             "note has changed since the supplied expected_sha256; read it again before writing"
         )
     content, refreshed = _refresh_updated(content)
+    rel = _rel(root, p)
     try:
         _atomic_write(p, content)
     except OSError as exc:
-        raise ValueError(f"cannot write {p!r}: {exc.strerror or type(exc).__name__}") from exc
-    rel = _rel(root, p)
+        raise ValueError(f"cannot write {rel!r}: {exc.strerror or type(exc).__name__}") from exc
+    # _sha256(content): content is UTF-8-encoded on the way out, so this is the bytes on disk.
     new_sha = _sha256(content)
     versioning = _git_result(root, root.name, [rel], f"vaults: {op} {rel}", new_sha)
     _invalidate_vault(root.name)
@@ -581,7 +603,7 @@ def delete_note(vault: str, path: str, missing_ok: bool = False) -> dict:
                 raise ValueError(f"note not found: {path!r}")
             return {"vault": vault, "path": path, "sha256_before": None}
         try:
-            sha_before = _sha256(_read_text(p))
+            sha_before = _sha256_bytes(p.read_bytes())
         except OSError:
             sha_before = None
         rel = _rel(root, p)
@@ -638,10 +660,10 @@ def move_note(
         if dst.exists():
             raise ValueError(f"destination exists: {dst_path!r}")
         try:
-            previous = _read_text(src)
+            previous_raw, previous = _read_note(src)
         except OSError as exc:
             raise ValueError(f"note not found: {src_path!r}") from exc
-        if expected_sha256 is not None and _sha256(previous) != expected_sha256:
+        if expected_sha256 is not None and _sha256_bytes(previous_raw) != expected_sha256:
             raise ValueError(
                 "note has changed since the supplied expected_sha256; read it again before moving"
             )
@@ -677,6 +699,7 @@ def move_note(
                 pass
         src_rel = _rel(root, src)
         dst_rel = _rel(root, dst)
+        # _sha256(content): content is UTF-8-encoded on the way out, so this is the bytes on disk.
         new_sha = _sha256(content)
         versioning = _git_result(
             root, vault, [dst_rel, src_rel], f"vaults: move {src_rel} -> {dst_rel}", new_sha
