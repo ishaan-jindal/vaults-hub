@@ -45,6 +45,28 @@ jobs:
         run: ruff format --check vaults server.py smoke_test.py
       - name: Smoke test
         run: python smoke_test.py
+      - name: Smoke test — ripgrep-absent fallback
+        # WHY separate: the pure-Python search fallback only runs when `rg` is
+        # absent from PATH, which is never true on ubuntu runners (they ship
+        # ripgrep), so the main smoke run above can only cover it through a
+        # self-doctored PATH. This step re-runs just that leg with `rg`
+        # shadowed out of PATH at the runner level as well, so the fallback
+        # stays covered even if the in-process PATH surgery ever no-ops.
+        run: |
+          set -euo pipefail
+          # Shadow every `rg` on PATH (there can be more than one); loop
+          # because `command -v` only reports the first.
+          for _ in 1 2 3 4 5 6 7 8; do
+            command -v rg >/dev/null 2>&1 || break
+            RG_DIR="$(dirname "$(command -v rg)")"
+            PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$RG_DIR" | paste -sd: -)"
+            export PATH
+          done
+          if command -v rg >/dev/null 2>&1; then
+            echo "::error::rg is still on PATH after shadowing" >&2
+            exit 1
+          fi
+          python smoke_test.py --only=rg-fallback
 
   # Independent of `python` on purpose: a Python failure must still surface
   # the npm results in the same run.

@@ -1,8 +1,11 @@
 """End-to-end smoke test for the vaults hub over a temporary stdio MCP server."""
 
 import asyncio
+import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -65,6 +68,334 @@ def err_text(res):
     return res.content[0].text if res.content else ""
 
 
+def _path_without_rg(scratch: Path) -> str:
+    """A PATH with ripgrep hidden, so the server falls back to pure-Python search.
+
+    PATH is directory-grained, so when rg lives alongside git (both are in
+    /usr/bin on ubuntu runners) the whole dir must go; git is then kept
+    reachable via one symlink in a scratch dir. Only `rg`/`git` matter here:
+    the server is spawned via an absolute sys.executable, so nothing else on
+    PATH is needed by this leg.
+    """
+    rg = shutil.which("rg")
+    if rg is None:
+        return os.environ.get("PATH", "")
+    # Every PATH dir holding an executable `rg` must go: which() only reports
+    # the first, but the server would happily find the second.
+    rg_dirs = {
+        d
+        for d in os.environ.get("PATH", "").split(os.pathsep)
+        if d and os.path.isfile(os.path.join(d, "rg")) and os.access(os.path.join(d, "rg"), os.X_OK)
+    }
+    kept = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d and d not in rg_dirs]
+    git = shutil.which("git")
+    if git is not None and str(Path(git).parent) in rg_dirs:
+        scratch.mkdir(parents=True, exist_ok=True)
+        link = scratch / "git"
+        if not link.exists():
+            os.symlink(git, link)
+        kept.insert(0, str(scratch))
+    return os.pathsep.join(kept)
+
+
+async def _write_search_corpus(session) -> None:
+    await session.call_tool("create_vault", {"vault": "Searchvault"})
+    corpus = [
+        ("alpha.md", "the quick brown fox\njumps over the lazy dog\nfox again here\n"),
+        ("beta.md", "FOX in capitals\nnothing relevant\n"),
+        ("gamma.md", "regex target abc123\nanother abc456 line\nplain filler\n"),
+    ]
+    for path, content in corpus:
+        res = await session.call_tool(
+            "write_note", {"vault": "Searchvault", "path": path, "content": content}
+        )
+        assert not res.isError, err_text(res)
+
+
+async def _collect_search_sets(session) -> dict:
+    """Full (untruncated) match sets plus the per-backend truncation contract.
+
+    Only the full sets are parity-compared across backends: match ORDER is
+    backend-dependent, so which single hit survives a limit cut can differ and
+    only the (limit/truncated/count) contract is pinned for those queries.
+    """
+    sets = {}
+    queries = {
+        "plain": {"query": "fox", "vault": "Searchvault"},
+        "regex": {"query": r"abc\d+", "vault": "Searchvault", "regex": True},
+        "casesens": {"query": "FOX", "vault": "Searchvault", "case_sensitive": True},
+    }
+    for key, kwargs in queries.items():
+        res = out(await session.call_tool("search_notes", kwargs))
+        assert res["truncated"] is False, res
+        sets[key] = sorted((m["vault"], m["path"], m["line"], m["text"]) for m in res["matches"])
+    assert len(sets["plain"]) == 3, sets  # alpha x2 (any case) + beta x1
+    assert len(sets["regex"]) == 2, sets
+    assert len(sets["casesens"]) == 1, sets
+    for limit in (1, 2):
+        cut = out(
+            await session.call_tool(
+                "search_notes", {"query": "fox", "vault": "Searchvault", "limit": limit}
+            )
+        )
+        assert cut["limit"] == limit, cut
+        assert len(cut["matches"]) == limit, cut
+        assert cut["truncated"] is True, cut
+    return sets
+
+
+async def _search_fallback_leg(vaults: Path, rg_sets: dict, scratch: Path) -> None:
+    """Re-run the search probes with rg hidden; results must equal the rg path."""
+    doctored = _path_without_rg(scratch)
+    fake_home = vaults / ".fakehome-search"
+    (fake_home / ".cache").mkdir(parents=True, exist_ok=True)
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(SERVER)],
+        env={
+            "VAULTS_ROOT": str(vaults),
+            "PYTHONUNBUFFERED": "1",
+            "PATH": doctored,
+            "HOME": str(fake_home),
+            "XDG_CACHE_HOME": str(fake_home / ".cache"),
+        },
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as fallback:
+            await fallback.initialize()
+            fb_info = out(await fallback.call_tool("server_info", {}))
+            # Fail loudly if the PATH surgery no-ops: otherwise this leg would
+            # silently exercise the rg path a second time instead of the fallback.
+            assert fb_info["ripgrep_available"] is False, fb_info
+            fb_sets = await _collect_search_sets(fallback)
+            assert fb_sets == rg_sets, (fb_sets, rg_sets)
+    print("search fallback parity OK")
+
+
+def _whole_line(line: str) -> bool:
+    """True for a complete Race.md line; a torn atomic write would leave a fragment."""
+    if line in ("seed", "from-A", "from-B"):
+        return True
+    return len(line) > 2 and line[:2] in ("A-", "B-") and line[2:].isdigit()
+
+
+async def _concurrency_leg(vaults: Path) -> None:
+    """Two server PROCESSES racing on one note via optimistic concurrency.
+
+    asyncio.gather drives two separate stdio subprocesses (not threads sharing
+    one server): the flock + atomic-write + expected_sha256 chain is exercised
+    across real process boundaries. Phase A is exactly-one-winner deterministic;
+    phase B hammers appends and pins no-torn-writes with a weak-but-stable
+    whole-line check (which hammer lines landed depends on scheduling).
+    """
+    fake_home = vaults / ".fakehome-concurrency"
+    (fake_home / ".cache").mkdir(parents=True, exist_ok=True)
+    env = {
+        "VAULTS_ROOT": str(vaults),
+        "PYTHONUNBUFFERED": "1",
+        "HOME": str(fake_home),
+        "XDG_CACHE_HOME": str(fake_home / ".cache"),
+    }
+    params_a = StdioServerParameters(command=sys.executable, args=[str(SERVER)], env=dict(env))
+    params_b = StdioServerParameters(command=sys.executable, args=[str(SERVER)], env=dict(env))
+    async with stdio_client(params_a) as (read_a, write_a):
+        async with ClientSession(read_a, write_a) as sess_a:
+            await sess_a.initialize()
+            async with stdio_client(params_b) as (read_b, write_b):
+                async with ClientSession(read_b, write_b) as sess_b:
+                    await sess_b.initialize()
+                    seed = out(
+                        await sess_a.call_tool(
+                            "write_note",
+                            {"vault": "Termchat", "path": "Race.md", "content": "seed\n"},
+                        )
+                    )
+                    s0 = seed["sha256"]
+
+                    # Phase A: both write from the same stale sha; one wins.
+                    res_a, res_b = await asyncio.gather(
+                        sess_a.call_tool(
+                            "write_note",
+                            {
+                                "vault": "Termchat",
+                                "path": "Race.md",
+                                "content": "from-A\n",
+                                "expected_sha256": s0,
+                            },
+                        ),
+                        sess_b.call_tool(
+                            "write_note",
+                            {
+                                "vault": "Termchat",
+                                "path": "Race.md",
+                                "content": "from-B\n",
+                                "expected_sha256": s0,
+                            },
+                        ),
+                    )
+                    winners = [r for r in (res_a, res_b) if not r.isError]
+                    losers = [r for r in (res_a, res_b) if r.isError]
+                    assert len(winners) == 1 and len(losers) == 1, (
+                        err_text(res_a),
+                        err_text(res_b),
+                    )
+                    loser_text = err_text(losers[0])
+                    assert "note has changed" in loser_text, loser_text
+                    assert "Traceback" not in loser_text, loser_text
+                    # The winner's sha describes the bytes on disk right now.
+                    raw = (vaults / "Termchat" / "Race.md").read_bytes()
+                    assert out(winners[0])["sha256"] == hashlib.sha256(raw).hexdigest()
+
+                    # Phase B: hammer appends; losers re-read and retry.
+                    async def _hammer(session, tag: str) -> list:
+                        shas = []
+                        for i in range(10):
+                            for _ in range(30):
+                                cur = out(
+                                    await session.call_tool(
+                                        "read_note",
+                                        {"vault": "Termchat", "path": "Race.md"},
+                                    )
+                                )
+                                res = await session.call_tool(
+                                    "append_note",
+                                    {
+                                        "vault": "Termchat",
+                                        "path": "Race.md",
+                                        "text": f"{tag}-{i}\n",
+                                        "expected_sha256": cur["sha256"],
+                                    },
+                                )
+                                if not res.isError:
+                                    shas.append(out(res)["sha256"])
+                                    break
+                                assert "note has changed" in err_text(res), err_text(res)
+                                assert "Traceback" not in err_text(res), err_text(res)
+                            else:
+                                raise AssertionError(f"{tag} append starved under contention")
+                        return shas
+
+                    hammer_shas = await asyncio.gather(_hammer(sess_a, "A"), _hammer(sess_b, "B"))
+                    final_raw = (vaults / "Termchat" / "Race.md").read_bytes()
+                    final_sha = hashlib.sha256(final_raw).hexdigest()
+                    final_text = final_raw.decode("utf-8")  # torn write = undecodable
+                    assert final_text.endswith("\n") and "\x00" not in final_text
+                    for line in final_text.splitlines():
+                        assert _whole_line(line), repr(line)
+                    # No lost appends: every hammer marker from both writers is
+                    # present exactly once (order-independent, so no flake).
+                    winner_line = "from-A" if winners[0] is res_a else "from-B"
+                    expected = sorted(
+                        [winner_line]
+                        + [f"A-{i}" for i in range(10)]
+                        + [f"B-{i}" for i in range(10)]
+                    )
+                    assert sorted(final_text.splitlines()) == expected, (
+                        sorted(final_text.splitlines()),
+                        expected,
+                    )
+                    final_read = out(
+                        await sess_a.call_tool(
+                            "read_note", {"vault": "Termchat", "path": "Race.md"}
+                        )
+                    )
+                    assert final_read["sha256"] == final_sha, final_read
+                    # The final bytes match one sha a process reported: never a
+                    # torn intermediate no process ever saw.
+                    seen = set(hammer_shas[0]) | set(hammer_shas[1])
+                    seen.add(out(winners[0])["sha256"])
+                    assert final_sha in seen, final_sha
+    print("concurrency OK")
+
+
+async def _error_log_leg(vaults: Path, temp_dir: str) -> None:
+    """The debug log exists by default: a failing tool call must create it.
+
+    _logged records every tool failure at ERROR with a traceback (ValueError
+    client errors included), so any isError call through a server whose HOME
+    points at a scratch dir must leave fakehome/.cache/vaults-hub/debug.log
+    with a traceback. The non-ValueError sanitization wording is pinned by the
+    separate vaults.config handler/level probe below.
+    """
+    fake_home = Path(temp_dir) / "fakehome"
+    (fake_home / ".cache").mkdir(parents=True, exist_ok=True)
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(SERVER)],
+        env={
+            "VAULTS_ROOT": str(vaults),
+            "PYTHONUNBUFFERED": "1",
+            "HOME": str(fake_home),
+            "XDG_CACHE_HOME": str(fake_home / ".cache"),
+        },
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            missing = await session.call_tool(
+                "read_note", {"vault": "Termchat", "path": "NoSuch.md"}
+            )
+            assert missing.isError
+    log = fake_home / ".cache" / "vaults-hub" / "debug.log"
+    assert log.is_file(), f"debug.log was not created under doctored HOME {fake_home}"
+    text = log.read_text(encoding="utf-8", errors="replace")
+    assert "Traceback" in text and "failed" in text, text[-1000:]
+
+    # Handler attached unconditionally at WARNING (default level): probed in a
+    # child process so the real ~/.cache is never touched by this suite.
+    probe_home = Path(temp_dir) / "fakehome-probe"
+    probe_home.mkdir(parents=True, exist_ok=True)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import logging; from vaults import config; "
+            "h = [x for x in config._logger.handlers]; "
+            "assert h, 'no log handler attached'; "
+            "assert config._logger.getEffectiveLevel() == logging.WARNING, "
+            "config._logger.getEffectiveLevel(); "
+            "assert config._logger.propagate is False, config._logger.propagate",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(HERE),
+        env={
+            **os.environ,
+            "HOME": str(probe_home),
+            "XDG_CACHE_HOME": str(probe_home / ".cache"),
+        },
+        timeout=60,
+    )
+    assert probe.returncode == 0, probe.stderr[-1000:]
+    print("error log OK")
+
+
+async def _rg_fallback_only() -> int:
+    """Standalone entry for the CI ripgrep-absent step (same leg, own root)."""
+    with tempfile.TemporaryDirectory(prefix="vaults-hub-norg-") as temp_dir:
+        vaults = Path(temp_dir)
+        fake_home = Path(temp_dir) / ".fakehome-rgonly"
+        (fake_home / ".cache").mkdir(parents=True, exist_ok=True)
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[str(SERVER)],
+            env={
+                "VAULTS_ROOT": str(vaults),
+                "PYTHONUNBUFFERED": "1",
+                "HOME": str(fake_home),
+                "XDG_CACHE_HOME": str(fake_home / ".cache"),
+            },
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                await _write_search_corpus(session)
+                rg_sets = await _collect_search_sets(session)
+        await _search_fallback_leg(vaults, rg_sets, Path(temp_dir) / "norgbin")
+    print("SMOKE OK (rg-fallback only)")
+    return 0
+
+
 def write_fixture(root: Path) -> None:
     (root / "Termchat").mkdir()
     (root / "Runnix").mkdir()
@@ -83,10 +414,18 @@ async def main() -> int:
     with tempfile.TemporaryDirectory(prefix="vaults-hub-") as temp_dir:
         vaults = Path(temp_dir)
         write_fixture(vaults)
+        fake_home_main = Path(temp_dir) / ".smoke-home"
+        (fake_home_main / ".cache").mkdir(parents=True, exist_ok=True)
+        fake_env = {
+            "VAULTS_ROOT": str(vaults),
+            "PYTHONUNBUFFERED": "1",
+            "HOME": str(fake_home_main),
+            "XDG_CACHE_HOME": str(fake_home_main / ".cache"),
+        }
         params = StdioServerParameters(
             command=sys.executable,
             args=[str(SERVER)],
-            env={"VAULTS_ROOT": str(vaults), "PYTHONUNBUFFERED": "1"},
+            env=dict(fake_env),
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
@@ -297,6 +636,41 @@ async def main() -> int:
                     "read_note", {"vault": "Termchat", "path": "Broken.md"}
                 )
                 assert not broken.isError, "non-UTF-8 note must not crash read_note"
+                # sha256 is over RAW FILE BYTES, even for non-UTF-8 notes.
+                broken_out = out(broken)
+                broken_raw = (vaults / "Termchat" / "Broken.md").read_bytes()
+                assert broken_out["sha256"] == hashlib.sha256(broken_raw).hexdigest()
+                lossy = broken_raw.decode("utf-8", errors="replace").encode("utf-8")
+                assert broken_out["sha256"] != hashlib.sha256(lossy).hexdigest(), (
+                    "sha must not be the hash of the lossy-decoded text"
+                )
+
+                # CRLF: content is universal-newline normalized, sha is raw bytes.
+                (vaults / "Termchat" / "Crlf.md").write_bytes(b"line1\r\nline2\r\n")
+                crlf = out(
+                    await session.call_tool("read_note", {"vault": "Termchat", "path": "Crlf.md"})
+                )
+                assert crlf["content"] == "line1\nline2\n", repr(crlf["content"])
+                assert "\r" not in crlf["content"]
+                assert crlf["sha256"] == hashlib.sha256(b"line1\r\nline2\r\n").hexdigest()
+                # CRLF read-then-append round trip: the append's OCC base sha
+                # must agree with the read sha (both derive from raw bytes).
+                crlf_append_res = await session.call_tool(
+                    "append_note",
+                    {
+                        "vault": "Termchat",
+                        "path": "Crlf.md",
+                        "text": "line3\n",
+                        "expected_sha256": crlf["sha256"],
+                    },
+                )
+                assert not crlf_append_res.isError, err_text(crlf_append_res)
+                crlf_appended = out(crlf_append_res)
+                assert crlf_appended["previous_sha256"] == crlf["sha256"], crlf_appended
+                crlf_after = out(
+                    await session.call_tool("read_note", {"vault": "Termchat", "path": "Crlf.md"})
+                )
+                assert crlf_after["content"] == "line1\nline2\nline3\n", repr(crlf_after["content"])
 
                 # Second Runnix match so truncation can be exercised below.
                 await session.call_tool(
@@ -711,6 +1085,113 @@ async def main() -> int:
                     {"vault": "Termchat", "path": "Vcs.md", "rev": "deadbeef" * 5},
                 )
                 assert bad_rev.isError, "bogus rev was not rejected"
+                # restore rejects option-injection / pathspec revs client-side.
+                for evil_rev in ("--output=pwned:note.md", "--help", "HEAD:other.md"):
+                    evil = await session.call_tool(
+                        "restore",
+                        {"vault": "Termchat", "path": "Vcs.md", "rev": evil_rev},
+                    )
+                    assert evil.isError, evil_rev
+                    evil_text = err_text(evil)
+                    assert "invalid rev" in evil_text, evil_text
+                    assert "fatal" not in evil_text.lower(), evil_text
+                    assert "Traceback" not in evil_text, evil_text
+                assert list((vaults / "Termchat").glob("*pwned*")) == []
+                assert not (vaults / "Termchat" / "pwned:note.md").exists()
+                assert [p for p in vaults.rglob("*pwned*") if ".git" not in p.parts] == []
+                # OCC chain works on non-UTF-8 notes: the fresh raw-bytes sha
+                # passes the guard, so a bogus rev fails as unknown-revision,
+                # never as "note has changed" (the old permanent failure).
+                broken_now = out(
+                    await session.call_tool("read_note", {"vault": "Termchat", "path": "Broken.md"})
+                )
+                occ_probe = await session.call_tool(
+                    "restore",
+                    {
+                        "vault": "Termchat",
+                        "path": "Broken.md",
+                        "rev": first_sha,
+                        "expected_sha256": broken_now["sha256"],
+                    },
+                )
+                assert occ_probe.isError, "untracked Broken.md restore should fail"
+                occ_text = err_text(occ_probe)
+                assert "note has changed" not in occ_text, occ_text
+                assert "unknown revision" in occ_text, occ_text
+                # history takes no git pathspec magic: a magic-looking path is
+                # an (untracked) literal, and leaks no other note's entries.
+                magic = await session.call_tool(
+                    "history", {"vault": "Termchat", "path": ":(glob)**/*.md"}
+                )
+                assert not magic.isError, err_text(magic)
+                magic_out = out(magic)
+                assert magic_out["history"] == [] and magic_out["untracked"] is True, magic_out
+                vcs_shas = {entry["sha"] for entry in hist2["history"]}
+                assert not vcs_shas & {entry["sha"] for entry in magic_out["history"]}, magic_out
+                # Git pathspec: a note literally named `:(glob)*.md` must not
+                # sweep other notes into its commit (regression for _pathspec).
+                await session.call_tool("create_vault", {"vault": "Specvault"})
+                spec_normal = out(
+                    await session.call_tool(
+                        "write_note",
+                        {"vault": "Specvault", "path": "normal.md", "content": "normal v1\n"},
+                    )
+                )
+                assert spec_normal["versioning"] == "ok", spec_normal
+                spec_magic = out(
+                    await session.call_tool(
+                        "write_note",
+                        {
+                            "vault": "Specvault",
+                            "path": ":(glob)*.md",
+                            "content": "magic v1\n",
+                        },
+                    )
+                )
+                assert spec_magic["versioning"] == "ok", spec_magic
+                assert (vaults / "Specvault" / ".git").is_dir()
+                (vaults / "Specvault" / "normal.md").write_text(
+                    "dirty uncommitted\n", encoding="utf-8"
+                )
+                spec_magic2 = out(
+                    await session.call_tool(
+                        "write_note",
+                        {
+                            "vault": "Specvault",
+                            "path": ":(glob)*.md",
+                            "content": "magic v2\n",
+                        },
+                    )
+                )
+                assert spec_magic2["versioning"] == "ok", spec_magic2
+                tip = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(vaults / "Specvault"),
+                        "show",
+                        "--name-only",
+                        "--pretty=format:",
+                        "HEAD",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                assert tip.returncode == 0, tip.stderr[-1000:]
+                touched = sorted(line for line in tip.stdout.splitlines() if line.strip())
+                assert touched == [":(glob)*.md"], touched
+                assert (vaults / "Specvault" / "normal.md").read_text(
+                    encoding="utf-8"
+                ) == "dirty uncommitted\n"
+                dirty = subprocess.run(
+                    ["git", "-C", str(vaults / "Specvault"), "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                assert dirty.returncode == 0, dirty.stderr[-1000:]
+                assert "normal.md" in dirty.stdout, dirty.stdout
                 print("VCS operations OK")
 
         # I: VAULTS_HUB_GIT=0 disables versioning (separate server process)
@@ -718,9 +1199,8 @@ async def main() -> int:
             command=sys.executable,
             args=[str(SERVER)],
             env={
-                "VAULTS_ROOT": str(vaults),
+                **fake_env,
                 "VAULTS_HUB_GIT": "0",
-                "PYTHONUNBUFFERED": "1",
             },
         )
         async with stdio_client(params_off) as (read, write):
@@ -745,9 +1225,32 @@ async def main() -> int:
                 assert r.isError, "restore with VAULTS_HUB_GIT=0 must error"
                 print("VCS opt-out OK")
 
+        # Search corpus for the rg/fallback parity leg (same root, own vault).
+        params_search = StdioServerParameters(
+            command=sys.executable,
+            args=[str(SERVER)],
+            env=dict(fake_env),
+        )
+        async with stdio_client(params_search) as (read, write):
+            async with ClientSession(read, write) as search_session:
+                await search_session.initialize()
+                await _write_search_corpus(search_session)
+                rg_sets = await _collect_search_sets(search_session)
+        await _search_fallback_leg(vaults, rg_sets, Path(temp_dir) / "norgbin")
+
+        # Core data-integrity chain under real multiprocess contention. Bounded
+        # so CI fails loudly instead of hanging (well under timeout-minutes).
+        await asyncio.wait_for(_concurrency_leg(vaults), timeout=120)
+
+        await _error_log_leg(vaults, temp_dir)
+
     print("SMOKE OK")
     return 0
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        if sys.argv[1:] == ["--only=rg-fallback"]:
+            raise SystemExit(asyncio.run(_rg_fallback_only()))
+        raise SystemExit(f"usage: {sys.argv[0]} [--only=rg-fallback]")
     raise SystemExit(asyncio.run(main()))
