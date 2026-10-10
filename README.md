@@ -266,7 +266,7 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 14 tools) <
   `indexes.py` (in-memory backlink/frontmatter indexes with mtime-based
   invalidation), `search.py` (ripgrep + Python-fallback search),
   `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 14
-  tools, stdio bridge). Root `server.py` is a thin shim so `python
+  tools). Root `server.py` is a thin shim so `python
   server.py` keeps working.
 - `server.py` keeps the event loop responsive: every tool runs its blocking
   library call in a worker thread via `anyio.to_thread`. Errors are

@@ -10,7 +10,7 @@ Stdio MCP server (Python, FastMCP) exposing Obsidian-style Markdown vaults under
   - `indexes.py`: backlink/tag indexes with mtime invalidation
   - `search.py`: `rg --json` plus a pure-Python fallback
   - `versioning.py`: per-vault local git
-  - `server.py`: 14 `@mcp.tool` wrappers and the stdio bridge
+  - `server.py`: 14 `@mcp.tool` wrappers on FastMCP's stock stdio transport
 - Root `server.py` is a compatibility shim; never put logic there.
 - `bin/vaults-hub.mjs` is the npm launcher. It finds Python 3.10+ and bootstraps the pinned deps into a cached venv.
 - `smoke_test.py` is the end-to-end suite and `npm_launcher_test.py` is the launcher integration test. There is no test framework, so don't add pytest or fixtures.

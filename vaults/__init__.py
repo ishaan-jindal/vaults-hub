@@ -7,19 +7,3 @@ or API keys involved. Spawned per-session by opencode over stdio.
 """
 
 __version__ = "0.2.0"
-
-__all__ = ["__version__", "main", "mcp"]
-
-
-def __getattr__(name: str):
-    """Lazily re-export server globals so `import vaults` stays light.
-
-    vaults.server is imported on first attribute access instead of at
-    package import time; this also keeps `python -m vaults.server` free
-    of duplicate-import warnings.
-    """
-    if name in ("main", "mcp"):
-        from vaults import server
-
-        return getattr(server, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

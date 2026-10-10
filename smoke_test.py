@@ -317,7 +317,7 @@ async def _concurrency_leg(vaults: Path) -> None:
 async def _error_log_leg(vaults: Path, temp_dir: str) -> None:
     """The debug log exists by default: a failing tool call must create it.
 
-    _logged records every tool failure at ERROR with a traceback (ValueError
+    _run_off_loop logs every tool failure at ERROR with a traceback (ValueError
     client errors included), so any isError call through a server whose HOME
     points at a scratch dir must leave fakehome/.cache/vaults-hub/debug.log
     with a traceback. The non-ValueError sanitization wording is pinned by the
