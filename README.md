@@ -184,6 +184,8 @@ How the server avoids losing or corrupting notes:
   external edits are picked up on the next read.
 - **Symlink confinement.** Symlink targets resolving outside the vault are
   rejected — a link can never pull reads or writes out of the vault.
+  Escaping wiki-link path targets (e.g. `[[../Outside.md]]`) are treated as
+  unresolved; `list_notes` skips escaping symlink entries instead of failing.
 
 ## Configuration
 
