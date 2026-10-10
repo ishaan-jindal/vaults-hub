@@ -583,6 +583,50 @@ async def main() -> int:
                 (outer / "sentinel.txt").unlink()
                 outer.rmdir()
 
+                # Wiki-link path escape is unresolved (not an existence oracle).
+                # Outward note symlink is skipped by list_notes; read_note still rejects.
+                confine_outer = Path(tempfile.mkdtemp(prefix="vaults-hub-confine-"))
+                (confine_outer / "Outside.md").write_text("secret\n", encoding="utf-8")
+                await session.call_tool("create_vault", {"vault": "Confine"})
+                (vaults / "Confine" / "subdir").mkdir()
+                (vaults / "Confine" / "subdir" / "Note.md").write_text("inside\n", encoding="utf-8")
+                await session.call_tool(
+                    "write_note",
+                    {
+                        "vault": "Confine",
+                        "path": "Links.md",
+                        "content": "[[../Outside.md]] and [[subdir/Note]]\n",
+                    },
+                )
+                os.symlink(confine_outer / "Outside.md", vaults / "Confine" / "evil.md")
+                (vaults / "Confine" / "ok.md").write_text("ok\n", encoding="utf-8")
+                links_out = out(
+                    await session.call_tool("read_note", {"vault": "Confine", "path": "Links.md"})
+                )
+                assert "subdir/Note" in links_out["links"], links_out
+                assert "../Outside.md" in links_out["unresolved_links"], links_out
+                assert "../Outside.md" not in links_out["links"], links_out
+                listed = out(
+                    await session.call_tool("list_notes", {"vault": "Confine", "path": ""})
+                )
+                assert "evil.md" not in listed["notes"], listed
+                assert "ok.md" in listed["notes"], listed
+                assert "Links.md" in listed["notes"], listed
+                listed_rec = out(
+                    await session.call_tool(
+                        "list_notes",
+                        {"vault": "Confine", "path": "", "recursive": True},
+                    )
+                )
+                assert "evil.md" not in listed_rec["notes"], listed_rec
+                assert "ok.md" in listed_rec["notes"], listed_rec
+                evil_read = await session.call_tool(
+                    "read_note", {"vault": "Confine", "path": "evil.md"}
+                )
+                assert evil_read.isError, "escaping note symlink must be rejected"
+                (vaults / "Confine" / "evil.md").unlink()
+                shutil.rmtree(confine_outer)
+
                 recreated = out(await session.call_tool("create_vault", {"vault": "Delvault"}))
                 assert recreated["created"] is True, recreated
                 relisted_after = out(await session.call_tool("list_vaults", {}))

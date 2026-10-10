@@ -11,6 +11,7 @@ from vaults.notes import (
     _rel,
     _resolve_link_fast,
     _split_frontmatter,
+    _under_vault,
     _vault_root,
     list_vaults,
 )
@@ -36,8 +37,12 @@ _INDEX_LOCK = threading.RLock()
 
 
 def _scan_notes(root: Path) -> list[Path]:
-    """Uncached recursive scan, skipping `.obsidian` trees."""
-    return sorted(p for p in root.rglob("*.md") if ".obsidian" not in p.parts)
+    """Uncached recursive scan, skipping `.obsidian` trees and vault escapes."""
+    return sorted(
+        p
+        for p in root.rglob("*.md")
+        if ".obsidian" not in p.parts and _under_vault(root, p) is not None
+    )
 
 
 def _dir_signature(root: Path) -> dict[str, int]:

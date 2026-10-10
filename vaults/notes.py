@@ -66,6 +66,17 @@ def _note_path(root: Path, rel: str) -> Path:
     return p
 
 
+def _under_vault(root: Path, p: Path) -> Path | None:
+    """Return resolved path if it stays under root; else None."""
+    try:
+        resolved = p.resolve()
+    except OSError:
+        return None
+    if resolved != root and root not in resolved.parents:
+        return None
+    return resolved
+
+
 def _sha256_bytes(data: bytes) -> str:
     # WHY: sha256 is defined over the exact bytes on disk so read/restore/
     # delete/move agree even for non-UTF-8 files whose lossy errors="replace"
@@ -250,18 +261,27 @@ def _refresh_updated(text: str) -> tuple[str, bool]:
     return text[: m.start(1)] + new_block + text[m.end(1) :], True
 
 
+def _resolve_path_link(root: Path, target: str) -> Path | None:
+    """Resolve a slash-containing wiki-link target; escape => unresolved."""
+    cand = _under_vault(root, root / target)
+    if cand is not None and cand.is_file():
+        return cand
+    cand_md = (root / target).with_suffix(".md") if not target.endswith(".md") else None
+    if cand_md is None:
+        return None
+    confined = _under_vault(root, cand_md)
+    return confined if confined is not None and confined.is_file() else None
+
+
 def _resolve_link_fast(root: Path, target: str, by_stem: dict[str, Path]) -> Path | None:
     """Resolve a wiki-link target using a prebuilt stem index."""
     target = target.strip()
     if not target:
         return None
     if "/" in target:
-        cand = (root / target).resolve()
-        if cand.is_file():
-            return cand
-        cand_md = cand.with_suffix(".md") if cand.suffix != ".md" else cand
-        return cand_md if cand_md.is_file() else None
-    return by_stem.get(target)
+        return _resolve_path_link(root, target)
+    hit = by_stem.get(target)
+    return _under_vault(root, hit) if hit is not None else None
 
 
 def _resolve_link(root: Path, target: str) -> Path | None:
@@ -271,12 +291,12 @@ def _resolve_link(root: Path, target: str) -> Path | None:
     if not target:
         return None
     if "/" in target:
-        cand = (root / target).resolve()
-        if cand.is_file():
-            return cand
-        cand_md = cand.with_suffix(".md") if cand.suffix != ".md" else cand
-        return cand_md if cand_md.is_file() else None
-    matches = [p for p in _all_notes(root) if p.stem == target]
+        return _resolve_path_link(root, target)
+    matches = [
+        confined
+        for p in _all_notes(root)
+        if p.stem == target and (confined := _under_vault(root, p)) is not None
+    ]
     if not matches:
         return None
     # Obsidian resolves duplicate note names to the shortest path.
@@ -464,10 +484,14 @@ def list_notes(
     for p in sorted(base.iterdir()):
         if p.name.startswith("."):
             continue
-        if p.is_dir():
-            dirs.append(_rel(root, p) + "/")
-        elif p.suffix == ".md":
-            notes.append(_rel(root, p))
+        try:
+            if p.is_dir():
+                dirs.append(_rel(root, p) + "/")
+            elif p.suffix == ".md":
+                notes.append(_rel(root, p))
+        except ValueError:
+            # Symlink (or other entry) that resolves outside the vault.
+            continue
     combined = [*dirs, *notes]
     total = len(combined)
     if offset > total:
