@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
 - `read_note` resolves wiki-links with one note scan instead of one per link.
 - Rejected `write_note` paths and no-op `delete_note(missing_ok=True)` calls
   no longer create directories or lock files.
+- npm launcher: concurrent first runs no longer share a half-built venv.
 
 ## [0.2.0] - 2026-09-27
 
