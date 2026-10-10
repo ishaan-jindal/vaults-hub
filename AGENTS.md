@@ -69,7 +69,8 @@ If you add a module under `vaults/`, also add it to the tarball file lists in `.
 
 - Never commit or push without asking. Commit with `git commit -s -S`.
 - Use Conventional Commits with the narrowest accurate scope, as in the existing history: `fix(vaults): ...`, `fix(launcher): ...`, `build(packaging): ...`, `test(vaults): ...`, `docs(readme): ...`, `ci: ...`.
-- Write an imperative, lowercase subject of 72 characters or fewer. Add a body only when the diff can't explain why. No AI-attribution trailers.
+- Write an imperative, lowercase subject of 72 characters or fewer. Add a body only when the diff can't explain why.
+- Never add agent attribution. No `Co-authored-by:` trailers for any AI, agent, or tool (Cursor, Claude, OpenCode, Codex, etc.), and no "Generated with" or "Made with" lines in commits, PR or issue titles and bodies, or comments. Strip any that a tool inserts automatically.
 - Keep diffs small and focused on one concern. Don't flatten intentional design (e.g. `# WHY:` and `# ponytail:` comments explain deliberate trade-offs).
 
 ## Code style
