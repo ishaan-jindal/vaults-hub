@@ -187,7 +187,8 @@ How the server avoids losing or corrupting notes:
 - **No surprise frontmatter.** Notes without a frontmatter block stay that
   way; `updated:` is only refreshed (or inserted) when a block exists.
 - **Fresh indexes.** Backlink/tag indexes are invalidated by mtime, so
-  external edits are picked up on the next read.
+  external edits are picked up on the next read. Like listings and search,
+  they skip notes in hidden folders such as `.obsidian/` and `.trash/`.
 - **Symlink confinement.** Symlink targets resolving outside the vault are
   rejected — a link can never pull reads or writes out of the vault.
   Escaping wiki-link path targets (e.g. `[[../Outside.md]]`) are treated as

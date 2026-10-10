@@ -38,7 +38,7 @@ Ruff isn't installed in `.venv`, so use `uvx` with the CI-pinned version. Run th
 - **Versioning fails open.** The file write is the source of truth. A git failure surfaces as `commit_error` and never blocks the write. Versioning never pushes, pulls, or fetches.
 - **Tool boundary.** Every tool runs its blocking call via `_run_off_loop` (`anyio.to_thread`). Only client-safe `ValueError`s reach the client, and everything else is sanitized; tracebacks go to the log file only.
 - **Stdout belongs to JSON-RPC.** Never `print` to stdout from the server. The `vaults` logger writes only to `~/.cache/vaults-hub/debug.log`; don't add stream handlers to it.
-- **Search parity.** The `rg` path and the Python fallback must return the same results, and both skip dotfiles and `.obsidian/`.
+- **Search parity.** The `rg` path and the Python fallback must return the same results, and both skip dotfiles and hidden folders (`.obsidian/`, `.trash/`). The backlink/tag indexes skip them too.
 - **Symlink confinement.** Reject any symlink target that resolves outside the vault.
 - **Packaging.** The npm tarball must not include `smoke_test.py`, `__pycache__`, or dotfiles. CI asserts the exact file list in both `ci.yml` and `release.yml`.
 

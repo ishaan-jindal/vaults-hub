@@ -24,6 +24,8 @@ All notable changes to this project will be documented in this file.
 - Rejected `write_note` paths and no-op `delete_note(missing_ok=True)` calls
   no longer create directories or lock files.
 - npm launcher: concurrent first runs no longer share a half-built venv.
+- Notes in hidden folders such as Obsidian's `.trash/` no longer contribute
+  backlinks or tag counts, matching `list_notes` and `search_notes`.
 - The server uses the MCP SDK's stock stdio transport instead of a custom
   stdin bridge.
 

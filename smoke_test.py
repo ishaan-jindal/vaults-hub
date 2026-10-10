@@ -960,10 +960,16 @@ async def main() -> int:
                         "content": "---\ntags: d\n---\nbody\n",
                     },
                 )
+                # Notes in hidden folders (Obsidian's .trash) feed neither tags nor backlinks.
+                (vaults / "Termchat" / ".trash").mkdir()
+                (vaults / "Termchat" / ".trash" / "Old.md").write_text(
+                    "---\ntags: [trashed]\n---\n[[TagList]]\n", encoding="utf-8"
+                )
                 tag_counts = out(await session.call_tool("list_tags", {"vault": "Termchat"}))
                 assert tag_counts["Termchat"].get("a/b") == 1, tag_counts
                 assert tag_counts["Termchat"].get("c") == 1, tag_counts
                 assert tag_counts["Termchat"].get("d") == 1, tag_counts
+                assert "trashed" not in tag_counts["Termchat"], tag_counts
                 tag_str = out(
                     await session.call_tool("read_note", {"vault": "Termchat", "path": "TagStr.md"})
                 )
@@ -974,6 +980,7 @@ async def main() -> int:
                     )
                 )
                 assert tag_list["frontmatter"]["tags"] == ["a/b", "c"], tag_list
+                assert tag_list["backlinks"] == [], tag_list
 
                 # E: search context
                 ctx_body = "l1\nl2\nl3 target\nl4\nl5\n"

@@ -38,11 +38,12 @@ _INDEX_LOCK = threading.RLock()
 
 
 def _scan_notes(root: Path) -> list[Path]:
-    """Uncached recursive scan, skipping `.obsidian` trees and vault escapes."""
+    """Uncached recursive scan, skipping hidden entries (`.obsidian`, `.trash`) and escapes."""
     return sorted(
         p
         for p in root.rglob("*.md")
-        if ".obsidian" not in p.parts and _under_vault(root, p) is not None
+        if not any(part.startswith(".") for part in p.relative_to(root).parts)
+        and _under_vault(root, p) is not None
     )
 
 
