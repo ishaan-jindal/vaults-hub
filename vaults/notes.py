@@ -129,14 +129,8 @@ def _strict_text(raw: bytes, path: str) -> str:
 
 
 @contextlib.contextmanager
-def _note_lock(path: Path):
-    """Serialize read-modify-write across processes via an flock'd lock file.
-
-    The note itself is replaced by _atomic_write, so locking the note's inode
-    would not survive the swap; a sibling ``.<name>.lock`` file avoids that.
-    """
-    lock_path = path.parent / f".{path.name}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+def _flock(lock_path: Path):
+    """Hold an exclusive cross-process flock on lock_path (created if missing)."""
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -144,6 +138,18 @@ def _note_lock(path: Path):
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+@contextlib.contextmanager
+def _note_lock(path: Path):
+    """Serialize read-modify-write across processes via an flock'd lock file.
+
+    The note itself is replaced by _atomic_write, so locking the note's inode
+    would not survive the swap; a sibling ``.<name>.lock`` file avoids that.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _flock(path.parent / f".{path.name}.lock"):
+        yield
 
 
 @contextlib.contextmanager
@@ -365,7 +371,7 @@ def delete_vault(vault: str, confirm: str) -> dict:
         _all_notes,
         _invalidate_vault,
     )  # deferred: avoids notes<->indexes cycle
-    from vaults.versioning import _GIT_MODE, _git_lock  # deferred: avoids notes<->versioning cycle
+    from vaults.versioning import _git_lock  # deferred: avoids notes<->versioning cycle
 
     name = (vault or "").strip()
     target = _valid_vault_name(name)
@@ -391,7 +397,6 @@ def delete_vault(vault: str, confirm: str) -> dict:
     with _git_lock(target):
         os.rename(target, trash)
         _invalidate_vault(name)
-        _GIT_MODE.pop(name, None)
         shutil.rmtree(trash)
     return {
         "vault": name,
@@ -473,7 +478,7 @@ def list_notes(
 
 
 def read_note(vault: str, path: str) -> dict:
-    from vaults.indexes import _BACKLINK_INDEX, _FRONTMATTER_INDEX, _all_notes, _ensure_indexes
+    from vaults.indexes import _BACKLINK_INDEX, _all_notes, _ensure_indexes
 
     root = _vault_root(vault)
     p = _note_path(root, path)
@@ -484,11 +489,7 @@ def read_note(vault: str, path: str) -> dict:
     _ensure_indexes(root, vault)
     raw, text = _read_note(p)
     rel = _rel(root, p)
-    cached_fm = _FRONTMATTER_INDEX.get(vault, {}).get(rel)
-    if cached_fm is None:
-        frontmatter, _ = _split_frontmatter(text)
-    else:
-        frontmatter = dict(cached_fm)
+    frontmatter, _ = _split_frontmatter(text)
     targets = [t.strip() for t in WIKI_LINK_RE.findall(text) if t.strip()]
     by_stem = _stem_index(_all_notes(root))
     links, unresolved = [], []
@@ -548,7 +549,6 @@ def _write_note_locked(
 
 
 def write_note(vault: str, path: str, content: str, expected_sha256: str | None = None) -> dict:
-    _ensure_utf8(content)
     root = _vault_root(vault)
     p = _note_path(root, path)
     if p.suffix != ".md":
@@ -628,10 +628,7 @@ def move_note(
     dst_path: str,
     expected_sha256: str | None = None,
 ) -> dict:
-    from vaults.indexes import (  # deferred: avoids notes<->indexes cycle
-        _ensure_indexes,
-        _invalidate_vault,
-    )
+    from vaults.indexes import _invalidate_vault  # deferred: avoids notes<->indexes cycle
     from vaults.versioning import _git_result  # deferred: avoids notes<->versioning cycle
 
     root = _vault_root(vault)
@@ -694,8 +691,6 @@ def move_note(
         versioning = _git_result(
             root, vault, [dst_rel, src_rel], f"vaults: move {src_rel} -> {dst_rel}", new_sha
         )
-        _invalidate_vault(vault)
-        _ensure_indexes(root, vault)
         return {
             "vault": vault,
             "src_path": src_path,

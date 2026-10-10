@@ -2,11 +2,11 @@
 
 import os
 import threading
+from collections import Counter
 from pathlib import Path
 
 from vaults.notes import (
     WIKI_LINK_RE,
-    _normalize_tags,
     _read_text,
     _rel,
     _resolve_link_fast,
@@ -38,11 +38,12 @@ _INDEX_LOCK = threading.RLock()
 
 
 def _scan_notes(root: Path) -> list[Path]:
-    """Uncached recursive scan, skipping `.obsidian` trees and vault escapes."""
+    """Uncached recursive scan, skipping hidden entries (`.obsidian`, `.trash`) and escapes."""
     return sorted(
         p
         for p in root.rglob("*.md")
-        if ".obsidian" not in p.parts and _under_vault(root, p) is not None
+        if not any(part.startswith(".") for part in p.relative_to(root).parts)
+        and _under_vault(root, p) is not None
     )
 
 
@@ -171,69 +172,22 @@ def _rebuild_indexes(root: Path, vault: str, scan: list[Path]) -> None:
 
 
 def _ensure_indexes(root: Path, vault: str) -> None:
-    """Validate caches by mtime; rebuild the vault on any mismatch.
+    """Rebuild the vault's indexes unless its note set and every note mtime are unchanged.
 
-    A matching per-directory signature plus per-file mtimes reuses the cache
-    without an rglob; a directory mtime change (new/deleted files, including
-    edits from another process) forces a rescan. First read pays the full
-    O(N^2) build, later reads reuse the cached backlink sets.
+    _all_notes notices added/removed notes via the directory signature; the
+    per-file mtimes catch in-place edits, including ones by another process.
     """
+    notes = _all_notes(root)
     with _INDEX_LOCK:
         mt = _INDEX_MTIMES.get(vault)
-        cached_bl = _BACKLINK_INDEX.get(vault)
-        cached_fm = _FRONTMATTER_INDEX.get(vault)
-        cached_notes = _NOTES_CACHE.get(vault)
-        sig_cached = _DIR_SIG.get(vault)
-    if (
-        mt is not None
-        and cached_bl is not None
-        and cached_fm is not None
-        and cached_notes is not None
-        and sig_cached is not None
-    ):
+        indexed = vault in _BACKLINK_INDEX and vault in _FRONTMATTER_INDEX
+    if mt is not None and indexed:
         try:
-            if _dir_signature(root) == sig_cached:
-                valid = True
-                for p in cached_notes:
-                    try:
-                        rel = _rel(root, p)
-                        cur = p.stat().st_mtime
-                    except (OSError, ValueError):
-                        valid = False
-                        break
-                    if mt.get(rel) != cur:
-                        valid = False
-                        break
-                if valid and set(mt.keys()) == {_rel(root, p) for p in cached_notes}:
-                    return
+            if {_rel(root, p): p.stat().st_mtime for p in notes} == mt:
+                return
         except (OSError, ValueError):
             pass
-    scan = _scan_notes(root)
-    with _INDEX_LOCK:
-        mt = _INDEX_MTIMES.get(vault)
-        cached_bl = _BACKLINK_INDEX.get(vault)
-        cached_fm = _FRONTMATTER_INDEX.get(vault)
-        if mt is not None and cached_bl is not None and cached_fm is not None:
-            try:
-                scan_rels = {_rel(root, p) for p in scan}
-            except ValueError:
-                scan_rels = set()
-            if set(mt.keys()) == scan_rels:
-                valid = True
-                for p in scan:
-                    try:
-                        rel = _rel(root, p)
-                        cur = p.stat().st_mtime
-                    except (OSError, ValueError):
-                        valid = False
-                        break
-                    if mt.get(rel) != cur:
-                        valid = False
-                        break
-                if valid:
-                    _NOTES_CACHE[vault] = list(scan)
-                    return
-    _rebuild_indexes(root, vault, scan)
+    _rebuild_indexes(root, vault, notes)
 
 
 def list_tags(vault: str | None = None) -> dict:
@@ -242,15 +196,8 @@ def list_tags(vault: str | None = None) -> dict:
     for name in names:
         root = _vault_root(name)
         _ensure_indexes(root, name)
-        counts: dict[str, int] = {}
-        for fm in _FRONTMATTER_INDEX.get(name, {}).values():
-            tags = fm.get("tags", [])
-            if isinstance(tags, str):
-                tags = _normalize_tags(tags)
-            if not isinstance(tags, list):
-                continue
-            for tag in tags:
-                key = str(tag)
-                counts[key] = counts.get(key, 0) + 1
+        counts = Counter(
+            tag for fm in _FRONTMATTER_INDEX.get(name, {}).values() for tag in fm.get("tags", [])
+        )
         result[name] = dict(sorted(counts.items()))
     return result

@@ -10,7 +10,7 @@ Stdio MCP server (Python, FastMCP) exposing Obsidian-style Markdown vaults under
   - `indexes.py`: backlink/tag indexes with mtime invalidation
   - `search.py`: `rg --json` plus a pure-Python fallback
   - `versioning.py`: per-vault local git
-  - `server.py`: 14 `@mcp.tool` wrappers and the stdio bridge
+  - `server.py`: 14 `@mcp.tool` wrappers on FastMCP's stock stdio transport
 - Root `server.py` is a compatibility shim; never put logic there.
 - `bin/vaults-hub.mjs` is the npm launcher. It finds Python 3.10+ and bootstraps the pinned deps into a cached venv.
 - `smoke_test.py` is the end-to-end suite and `npm_launcher_test.py` is the launcher integration test. There is no test framework, so don't add pytest or fixtures.
@@ -20,7 +20,6 @@ Stdio MCP server (Python, FastMCP) exposing Obsidian-style Markdown vaults under
 ```bash
 source .venv/bin/activate                 # or: python -m venv .venv && pip install -r requirements.txt
 python smoke_test.py                      # must exit 0, prints SMOKE OK
-python smoke_test.py --only=rg-fallback   # pure-Python search leg only
 python npm_launcher_test.py               # needs Node; prints LAUNCHER OK
 uvx ruff@0.15.22 check vaults server.py smoke_test.py
 uvx ruff@0.15.22 format --check vaults server.py smoke_test.py
@@ -38,9 +37,9 @@ Ruff isn't installed in `.venv`, so use `uvx` with the CI-pinned version. Run th
 - **Versioning fails open.** The file write is the source of truth. A git failure surfaces as `commit_error` and never blocks the write. Versioning never pushes, pulls, or fetches.
 - **Tool boundary.** Every tool runs its blocking call via `_run_off_loop` (`anyio.to_thread`). Only client-safe `ValueError`s reach the client, and everything else is sanitized; tracebacks go to the log file only.
 - **Stdout belongs to JSON-RPC.** Never `print` to stdout from the server. The `vaults` logger writes only to `~/.cache/vaults-hub/debug.log`; don't add stream handlers to it.
-- **Search parity.** The `rg` path and the Python fallback must return the same results, and both skip dotfiles and `.obsidian/`.
+- **Search parity.** The `rg` path and the Python fallback must return the same results, and both skip dotfiles and hidden folders (`.obsidian/`, `.trash/`). The backlink/tag indexes skip them too.
 - **Symlink confinement.** Reject any symlink target that resolves outside the vault.
-- **Packaging.** The npm tarball must not include `smoke_test.py`, `__pycache__`, or dotfiles. CI asserts the exact file list in both `ci.yml` and `release.yml`.
+- **Packaging.** The npm tarball must not include `smoke_test.py`, `__pycache__`, or dotfiles. `ci.yml` asserts the exact file list, and `release.yml` reuses `ci.yml` as its verify job.
 
 ## Adding or changing a tool
 
@@ -51,16 +50,11 @@ Ruff isn't installed in `.venv`, so use `uvx` with the CI-pinned version. Run th
 5. Add a `CHANGELOG.md` entry.
 6. MCP clients cache `tools/list` at initialize, so restart them to see schema changes.
 
-If you add a module under `vaults/`, also add it to the tarball file lists in `.github/workflows/ci.yml` and `release.yml`.
+If you add a module under `vaults/`, also add it to the tarball file list in `.github/workflows/ci.yml`.
 
 ## Release
 
-1. Bump all six version literals together:
-   - `pyproject.toml`
-   - `package.json`
-   - `vaults/server.py` `SERVER_VERSION`
-   - `vaults/__init__.py` `__version__`
-   - the two version asserts in `smoke_test.py`
+1. Bump all three version literals together: `pyproject.toml`, `package.json`, and `vaults/__init__.py` `__version__` (`SERVER_VERSION` and the smoke test derive from these).
 2. Add a `## [x.y.z]` section to `CHANGELOG.md`.
 3. Commit, then push the tag `v<version>` from the local machine. CI then verifies, publishes to npm via OIDC, and creates the GitHub Release.
 4. Agents never create or push tags without explicit approval.

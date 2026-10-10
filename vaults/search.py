@@ -53,11 +53,10 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
         "--no-heading",
         # WHY: the fallback can only mirror "every non-hidden, non-symlinked .md
         # note", so ignore files are off and only .md is searched (later globs win).
+        # The hidden-path glob also covers .obsidian and survives a ripgreprc --hidden.
         "--no-ignore",
         "--glob",
         "*.md",
-        "--glob",
-        "!**/.obsidian/**",
         "--glob",
         "!**/.*",
     ]
@@ -94,10 +93,6 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
                 # Non-UTF-8 paths arrive as {"bytes": "<base64>"} with no
                 # "text" key; skip rather than crash the tool.
                 continue
-            if any(part.startswith(".") for part in rel.split("/")):
-                continue
-            if ".obsidian" in rel.split("/"):
-                continue
             hits.append(
                 {
                     "vault": root.name,
@@ -114,11 +109,8 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
 
 
 def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
-    flags = 0 if case_sensitive else re.IGNORECASE
-    try:
-        pat = re.compile(query if regex else re.escape(query), flags)
-    except re.error as exc:
-        raise ValueError(f"invalid regular expression: {exc}") from exc
+    # search_notes already rejected invalid regexes, so this compile cannot fail.
+    pat = re.compile(query if regex else re.escape(query), 0 if case_sensitive else re.IGNORECASE)
     hits: list[dict] = []
     for root in roots:
         for p in _all_notes(root):
@@ -128,11 +120,6 @@ def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
             try:
                 rel = _rel(root, p)
             except ValueError:
-                continue
-            parts = rel.split("/")
-            if any(part.startswith(".") for part in parts):
-                continue
-            if ".obsidian" in parts:
                 continue
             try:
                 lines = _read_text(p).splitlines()

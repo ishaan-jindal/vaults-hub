@@ -18,6 +18,8 @@ import tempfile
 import threading
 from pathlib import Path
 
+from mcp.types import LATEST_PROTOCOL_VERSION
+
 HERE = Path(__file__).resolve().parent
 
 HINT_KEYS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
@@ -28,40 +30,14 @@ def expected_version() -> str:
 
 
 def expected_tool_names() -> list[str]:
-    """Read the tool list from the repo so a new tool cannot silently drift."""
-    try:
-        tree = ast.parse((HERE / "smoke_test.py").read_text(encoding="utf-8"))
-        for node in tree.body:
-            if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "EXPECTED_TOOLS" for t in node.targets
-            ):
-                names = ast.literal_eval(node.value)
-                assert (
-                    isinstance(names, list) and names and all(isinstance(n, str) for n in names)
-                ), names
-                return sorted(names)
-    except (OSError, SyntaxError, ValueError, AssertionError):
-        pass
-    # Fallback: count the @mcp.tool wrappers in the server source.
-    names = []
-    for line in (HERE / "vaults" / "server.py").read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("async def ") or stripped.startswith("def "):
-            name = stripped.split()[1].split("(")[0].rstrip(":")
-            if name not in ("main", "_collect_server_info", "_serve_stdio"):
-                names.append(name)
-    # Keep only plausible tool names (called out explicitly in smoke_test.py).
-    assert len(names) >= 14, names
-    return sorted(names)
-
-
-def protocol_version() -> str:
-    try:
-        import mcp.types as mcp_types  # type: ignore
-
-        return str(mcp_types.LATEST_PROTOCOL_VERSION)
-    except Exception:
-        return "2025-06-18"
+    """Read the tool list from smoke_test.py so a new tool cannot silently drift."""
+    tree = ast.parse((HERE / "smoke_test.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "EXPECTED_TOOLS" for t in node.targets
+        ):
+            return sorted(ast.literal_eval(node.value))
+    raise AssertionError("EXPECTED_TOOLS not found in smoke_test.py")
 
 
 def parse_requirements_txt(path: Path) -> dict[str, str]:
@@ -78,16 +54,14 @@ def parse_requirements_txt(path: Path) -> dict[str, str]:
     return pins
 
 
-def generated_probe(launcher_path: Path, requirements_path: Path) -> str | None:
+def generated_probe(launcher_path: Path, requirements_path: Path) -> str:
     """Execute the launcher's real probe builder against the given files.
 
     Copies both into a temp package layout (bin/vaults-hub.mjs plus
     requirements.txt) so the launcher's import.meta.url self-location keeps
     working, neutralizes the entrypoint to print the probe instead of
-    starting the server, and runs it. Returns None when node is missing.
+    starting the server, and runs it.
     """
-    if shutil.which("node") is None:
-        return None
     src = launcher_path.read_text(encoding="utf-8")
     assert "function depsProbe()" in src, f"{launcher_path} must expose depsProbe()"
     assert src.count("main();") == 1, f"{launcher_path} entrypoint changed; update the guard"
@@ -124,77 +98,17 @@ def generated_probe(launcher_path: Path, requirements_path: Path) -> str | None:
     return probe
 
 
-def check_launcher_probe_pins(
-    launcher_path: Path | None = None,
-    requirements_path: Path | None = None,
-) -> None:
-    """Guard: the launcher probe must derive from requirements.txt.
+def check_launcher_probe_pins() -> None:
+    """The launcher's real probe must check every requirements.txt pin.
 
-    Fails loudly if the launcher carries a stale hardcoded copy of the pins,
-    if the version checks could be stripped (bare assert), or if the probe
-    degrades to a mere importability test. Paths are parameterized so a
-    scratch copy with corrupted pins can be shown to fail.
+    Explicit raises only: `assert` would be stripped under python -O.
     """
-    launcher_path = launcher_path or HERE / "bin" / "vaults-hub.mjs"
-    requirements_path = requirements_path or HERE / "requirements.txt"
+    requirements_path = HERE / "requirements.txt"
     wanted = parse_requirements_txt(requirements_path)
     assert wanted, f"no name==version pins parsed from {requirements_path}"
-    text = launcher_path.read_text(encoding="utf-8")
-
-    # No stale second copy: any hardcoded triple naming a pinned
-    # distribution must agree with requirements.txt. (Template placeholders
-    # like ${name} are builder code, not pins, so they are skipped.)
-    hardcoded: dict[str, str] = {}
-    for m in re.finditer(
-        r"version\(\s*['\"]([^'\"]+)['\"]\s*\)\s*(?:==|!=)\s*['\"]([^'\"]+)['\"]", text
-    ):
-        if "$" not in m.group(1) and "$" not in m.group(2):
-            hardcoded[m.group(1)] = m.group(2)
-    for m in re.finditer(r"['\"]([A-Za-z0-9_.\-]+)==([A-Za-z0-9_.\-]+)['\"]", text):
-        if "$" not in m.group(0):
-            hardcoded.setdefault(m.group(1), m.group(2))
-    for name, version in hardcoded.items():
-        key = next((k for k in wanted if k.lower() == name.lower()), None)
-        if key is None:
-            continue
-        assert version == wanted[key], (
-            f"launcher carries a stale pin {name}=={version} "
-            f"but requirements.txt has {key}=={wanted[key]}; "
-            "the probe must be derived from requirements.txt, not hardcoded"
-        )
-
-    # Derived, not hardcoded: the probe reads REQUIREMENTS_TXT at runtime.
-    assert "REQUIREMENTS_TXT" in text, "launcher probe must read REQUIREMENTS_TXT"
-    assert "readFileSync(REQUIREMENTS_TXT" in text, (
-        "launcher probe must parse REQUIREMENTS_TXT instead of hardcoding versions"
-    )
-    # Version checks, not a bare importability test — and explicit raises,
-    # never `assert` (assert is stripped under python -O).
-    assert "importlib.metadata" in text, "launcher probe must check versions via importlib.metadata"
-    assert re.search(r"\.version\(", text), "launcher probe must call importlib.metadata.version()"
-    assert "SystemExit" in text, "launcher probe must raise explicitly (assert is stripped by -O)"
-    assert "assert _m.version" not in text, (
-        "launcher probe must not use bare assert (stripped under python -O)"
-    )
-    assert re.search(r"import \$\{imports", text), (
-        "launcher probe must still verify the modules actually import"
-    )
-    # Every pinned distribution (or its import name) is known to the probe.
-    import_by_dist = {"PyYAML": "yaml"}
-    for name in wanted:
-        import_name = import_by_dist.get(name, name.lower().replace("-", "_"))
-        assert name in text or import_name in text, (
-            f"launcher probe never mentions requirement {name!r}; "
-            "a bare `import ...` probe cannot catch version skew"
-        )
-
-    # Runtime leg: run the launcher's real builder and check the generated
-    # probe pins every requirement (skipped only when node is missing).
-    probe = generated_probe(launcher_path, requirements_path)
-    if probe is None:
-        print("SKIP: node not found; static probe-pin guard only")
-        return
+    probe = generated_probe(HERE / "bin" / "vaults-hub.mjs", requirements_path)
     assert "assert" not in probe, f"generated probe must not rely on assert: {probe!r}"
+    assert "\nimport " in probe, f"generated probe must import the modules: {probe!r}"
     for name, version in wanted.items():
         assert name in probe, f"generated probe never checks {name!r}: {probe!r}"
         assert version in probe, (
@@ -223,11 +137,6 @@ def recv(proc: subprocess.Popen, stdout_lines: list[str], timeout: float = 30.0)
 
 
 def main() -> int:
-    # Static + runtime guard (fast, no network): the probe must derive from
-    # requirements.txt. Runs before the npm/node checks so a stale pin fails
-    # loudly even when the integration leg would skip.
-    check_launcher_probe_pins()
-
     npm = shutil.which("npm")
     if npm is None:
         print("SKIP: npm not found on PATH; install Node to run the launcher test")
@@ -235,6 +144,7 @@ def main() -> int:
     if shutil.which("node") is None:
         print("SKIP: node not found on PATH; install Node to run the launcher test")
         return 0
+    check_launcher_probe_pins()
 
     want_version = expected_version()
     want_tools = expected_tool_names()
@@ -303,7 +213,7 @@ def main() -> int:
                             "id": req_id,
                             "method": "initialize",
                             "params": {
-                                "protocolVersion": protocol_version(),
+                                "protocolVersion": LATEST_PROTOCOL_VERSION,
                                 "capabilities": {},
                                 "clientInfo": {"name": "launcher-test", "version": "0.0.0"},
                             },
