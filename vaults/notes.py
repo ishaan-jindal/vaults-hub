@@ -129,14 +129,8 @@ def _strict_text(raw: bytes, path: str) -> str:
 
 
 @contextlib.contextmanager
-def _note_lock(path: Path):
-    """Serialize read-modify-write across processes via an flock'd lock file.
-
-    The note itself is replaced by _atomic_write, so locking the note's inode
-    would not survive the swap; a sibling ``.<name>.lock`` file avoids that.
-    """
-    lock_path = path.parent / f".{path.name}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+def _flock(lock_path: Path):
+    """Hold an exclusive cross-process flock on lock_path (created if missing)."""
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -144,6 +138,18 @@ def _note_lock(path: Path):
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+@contextlib.contextmanager
+def _note_lock(path: Path):
+    """Serialize read-modify-write across processes via an flock'd lock file.
+
+    The note itself is replaced by _atomic_write, so locking the note's inode
+    would not survive the swap; a sibling ``.<name>.lock`` file avoids that.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _flock(path.parent / f".{path.name}.lock"):
+        yield
 
 
 @contextlib.contextmanager
@@ -365,7 +371,7 @@ def delete_vault(vault: str, confirm: str) -> dict:
         _all_notes,
         _invalidate_vault,
     )  # deferred: avoids notes<->indexes cycle
-    from vaults.versioning import _GIT_MODE, _git_lock  # deferred: avoids notes<->versioning cycle
+    from vaults.versioning import _git_lock  # deferred: avoids notes<->versioning cycle
 
     name = (vault or "").strip()
     target = _valid_vault_name(name)
@@ -391,7 +397,6 @@ def delete_vault(vault: str, confirm: str) -> dict:
     with _git_lock(target):
         os.rename(target, trash)
         _invalidate_vault(name)
-        _GIT_MODE.pop(name, None)
         shutil.rmtree(trash)
     return {
         "vault": name,
