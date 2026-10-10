@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+- Wiki-link resolution is confined to the vault: path targets that escape it
+  (e.g. `[[../Outside.md]]`) and name links to notes resolving outside it are
+  treated as unresolved instead of being followed.
+- The backlink/tag index scan skips notes whose real path is outside the vault.
+- `list_notes` skips symlink entries that resolve outside the vault instead of
+  failing the whole listing.
+- Name links to an in-vault symlinked note now resolve to the symlink's target
+  file, so backlinks are attributed to the real note.
+
 ## [0.2.0] - 2026-09-27
 
 - npm package (`vaults-hub` bin): run via `npx -y vaults-hub`; the launcher
