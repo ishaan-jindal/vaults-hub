@@ -28,6 +28,8 @@ All notable changes to this project will be documented in this file.
   backlinks or tag counts, matching `list_notes` and `search_notes`.
 - The server uses the MCP SDK's stock stdio transport instead of a custom
   stdin bridge.
+- The release workflow runs the full CI (all Python versions and the
+  launcher test) before publishing.
 
 ## [0.2.0] - 2026-09-27
 

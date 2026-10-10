@@ -376,32 +376,6 @@ async def _error_log_leg(vaults: Path, temp_dir: str) -> None:
     print("error log OK")
 
 
-async def _rg_fallback_only() -> int:
-    """Standalone entry for the CI ripgrep-absent step (same leg, own root)."""
-    with tempfile.TemporaryDirectory(prefix="vaults-hub-norg-") as temp_dir:
-        vaults = Path(temp_dir)
-        fake_home = Path(temp_dir) / ".fakehome-rgonly"
-        (fake_home / ".cache").mkdir(parents=True, exist_ok=True)
-        params = StdioServerParameters(
-            command=sys.executable,
-            args=[str(SERVER)],
-            env={
-                "VAULTS_ROOT": str(vaults),
-                "PYTHONUNBUFFERED": "1",
-                "HOME": str(fake_home),
-                "XDG_CACHE_HOME": str(fake_home / ".cache"),
-            },
-        )
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                await _write_search_corpus(session, vaults)
-                rg_sets = await _collect_search_sets(session)
-        await _search_fallback_leg(vaults, rg_sets, Path(temp_dir) / "norgbin")
-    print("SMOKE OK (rg-fallback only)")
-    return 0
-
-
 def write_fixture(root: Path) -> None:
     (root / "Termchat").mkdir()
     (root / "Runnix").mkdir()
@@ -1354,8 +1328,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        if sys.argv[1:] == ["--only=rg-fallback"]:
-            raise SystemExit(asyncio.run(_rg_fallback_only()))
-        raise SystemExit(f"usage: {sys.argv[0]} [--only=rg-fallback]")
     raise SystemExit(asyncio.run(main()))

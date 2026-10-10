@@ -4,14 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 # Least privilege by default; each job declares exactly what it needs.
 permissions: {}
 
-# Safe for CI: a superseded run never publishes anything, so kill it.
+# A superseded CI run never publishes anything, so kill it; but release.yml
+# calls this workflow on tags, and a release must never be cancelled.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   python:
@@ -44,29 +46,8 @@ jobs:
       - name: Ruff format check
         run: ruff format --check vaults server.py smoke_test.py
       - name: Smoke test
+        # Includes the ripgrep-absent fallback leg, which fails if rg stays on PATH.
         run: python smoke_test.py
-      - name: Smoke test — ripgrep-absent fallback
-        # WHY separate: the pure-Python search fallback only runs when `rg` is
-        # absent from PATH, which is never true on ubuntu runners (they ship
-        # ripgrep), so the main smoke run above can only cover it through a
-        # self-doctored PATH. This step re-runs just that leg with `rg`
-        # shadowed out of PATH at the runner level as well, so the fallback
-        # stays covered even if the in-process PATH surgery ever no-ops.
-        run: |
-          set -euo pipefail
-          # Shadow every `rg` on PATH (there can be more than one); loop
-          # because `command -v` only reports the first.
-          for _ in 1 2 3 4 5 6 7 8; do
-            command -v rg >/dev/null 2>&1 || break
-            RG_DIR="$(dirname "$(command -v rg)")"
-            PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$RG_DIR" | paste -sd: -)"
-            export PATH
-          done
-          if command -v rg >/dev/null 2>&1; then
-            echo "::error::rg is still on PATH after shadowing" >&2
-            exit 1
-          fi
-          python smoke_test.py --only=rg-fallback
 
   # Independent of `python` on purpose: a Python failure must still surface
   # the npm results in the same run.
@@ -91,51 +72,28 @@ jobs:
       - name: Syntax-check launcher
         run: node --check bin/vaults-hub.mjs
       - name: Assert tarball file list
+        # A broken package must never be published; the list is exact, so
+        # tests, __pycache__ and dotfiles can never sneak in.
         run: |
           set -euo pipefail
-          # The dry-run must succeed; the authoritative assertion below runs
-          # against a real tarball because `npm pack --dry-run` omits the
-          # `package/` prefix on some npm versions while `tar -tzf` always
-          # carries it.
-          npm pack --dry-run 2>&1 | tee pack-dry-run.log
           PACK_TMP="$(mktemp -d)"
           trap 'rm -rf "$PACK_TMP"' EXIT
-          npm pack --pack-destination "$PACK_TMP" > pack-name.txt
-          cat pack-name.txt
-          TARBALL="$PACK_TMP/$(cat pack-name.txt)"
-          tar -tzf "$TARBALL" | sort > pack-files.txt
-          cat pack-files.txt
-          fail() {
-            echo "::error::$1" >&2
-            echo "--- actual tarball contents ---" >&2
-            cat pack-files.txt >&2
-            exit 1
-          }
-          for f in \
-            "package/bin/vaults-hub.mjs" \
-            "package/server.py" \
-            "package/requirements.txt" \
-            "package/vaults/__init__.py" \
-            "package/vaults/config.py" \
-            "package/vaults/indexes.py" \
-            "package/vaults/notes.py" \
-            "package/vaults/search.py" \
-            "package/vaults/server.py" \
-            "package/vaults/versioning.py" \
-            "package/README.md" \
-            "package/LICENSE" \
-            "package/package.json"; do
-            grep -qxF "$f" pack-files.txt || fail "tarball missing expected file: $f"
-          done
-          if grep -q "smoke_test.py" pack-files.txt; then
-            fail "tarball must not contain smoke_test.py"
-          fi
-          if grep -q "__pycache__" pack-files.txt; then
-            fail "tarball must not contain __pycache__"
-          fi
-          if grep -qE '(^|/)\.' pack-files.txt; then
-            fail "tarball must not contain dotfiles"
-          fi
+          TARBALL="$PACK_TMP/$(npm pack --pack-destination "$PACK_TMP")"
+          diff -u - <(tar -tzf "$TARBALL" | LC_ALL=C sort) <<'EOF'
+          package/LICENSE
+          package/README.md
+          package/bin/vaults-hub.mjs
+          package/package.json
+          package/requirements.txt
+          package/server.py
+          package/vaults/__init__.py
+          package/vaults/config.py
+          package/vaults/indexes.py
+          package/vaults/notes.py
+          package/vaults/search.py
+          package/vaults/server.py
+          package/vaults/versioning.py
+          EOF
           echo "tarball file list OK"
       - name: Launcher integration test
         run: python3 npm_launcher_test.py

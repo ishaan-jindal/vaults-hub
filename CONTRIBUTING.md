@@ -32,7 +32,7 @@ ruff format --check vaults server.py smoke_test.py
 CI runs on every push to main and every pull request, with two independent jobs:
 
 - `python`: matrix over 3.10 / 3.12 / 3.14 running `ruff check`, `ruff format --check`, and `python smoke_test.py`.
-- `npm`: syntax-checks the launcher (`node --check bin/vaults-hub.mjs`), asserts the tarball file list (a broken package must never be published), and runs `python npm_launcher_test.py`.
+- `npm`: syntax-checks the launcher (`node --check bin/vaults-hub.mjs`), asserts the exact tarball file list (a broken package must never be published), and runs `python npm_launcher_test.py`.
 
 The two jobs are independent on purpose, so one failure does not hide the other's result.
 
@@ -44,7 +44,7 @@ Release procedure, in order:
 2. Bump the six version literals together (`pyproject.toml`, `package.json`, `vaults/server.py` `SERVER_VERSION`, `vaults/__init__.py` `__version__`, and the two version asserts in `smoke_test.py`). The release workflow fails if the tag disagrees with `package.json`.
 3. Commit + push to main.
 4. Push the `v<version>` tag from your machine (`git push origin v<version>`). Tags are pushed from your machine, never from CI.
-5. CI takes over: the `verify` job re-runs the smoke test, the launcher syntax check, and the tarball file-list assertion; the `publish` job publishes to npm via OIDC trusted publishing; the `release` job creates the GitHub Release with notes extracted from the `CHANGELOG.md` section for that version.
+5. CI takes over: the `verify` job re-runs the whole CI workflow (both jobs above); the `publish` job publishes to npm via OIDC trusted publishing; the `release` job creates the GitHub Release with notes extracted from the `CHANGELOG.md` section for that version.
 
 One-time manual bootstrap: `0.2.0` must be published by hand with `npm publish` from a laptop, because npm's OIDC trusted publishing cannot create a new package name. Afterwards, configure the Trusted Publisher on npmjs.com for the `vaults-hub` package: user `ishaan-jindal`, repository `vaults-hub`, workflow filename `release.yml`, environment blank, and explicitly allow `npm publish` (new configs default to stage-only). Every release from `0.3.0` onward is then fully automated.
 

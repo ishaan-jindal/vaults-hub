@@ -20,7 +20,6 @@ Stdio MCP server (Python, FastMCP) exposing Obsidian-style Markdown vaults under
 ```bash
 source .venv/bin/activate                 # or: python -m venv .venv && pip install -r requirements.txt
 python smoke_test.py                      # must exit 0, prints SMOKE OK
-python smoke_test.py --only=rg-fallback   # pure-Python search leg only
 python npm_launcher_test.py               # needs Node; prints LAUNCHER OK
 uvx ruff@0.15.22 check vaults server.py smoke_test.py
 uvx ruff@0.15.22 format --check vaults server.py smoke_test.py
@@ -40,7 +39,7 @@ Ruff isn't installed in `.venv`, so use `uvx` with the CI-pinned version. Run th
 - **Stdout belongs to JSON-RPC.** Never `print` to stdout from the server. The `vaults` logger writes only to `~/.cache/vaults-hub/debug.log`; don't add stream handlers to it.
 - **Search parity.** The `rg` path and the Python fallback must return the same results, and both skip dotfiles and hidden folders (`.obsidian/`, `.trash/`). The backlink/tag indexes skip them too.
 - **Symlink confinement.** Reject any symlink target that resolves outside the vault.
-- **Packaging.** The npm tarball must not include `smoke_test.py`, `__pycache__`, or dotfiles. CI asserts the exact file list in both `ci.yml` and `release.yml`.
+- **Packaging.** The npm tarball must not include `smoke_test.py`, `__pycache__`, or dotfiles. `ci.yml` asserts the exact file list, and `release.yml` reuses `ci.yml` as its verify job.
 
 ## Adding or changing a tool
 
@@ -51,7 +50,7 @@ Ruff isn't installed in `.venv`, so use `uvx` with the CI-pinned version. Run th
 5. Add a `CHANGELOG.md` entry.
 6. MCP clients cache `tools/list` at initialize, so restart them to see schema changes.
 
-If you add a module under `vaults/`, also add it to the tarball file lists in `.github/workflows/ci.yml` and `release.yml`.
+If you add a module under `vaults/`, also add it to the tarball file list in `.github/workflows/ci.yml`.
 
 ## Release
 
