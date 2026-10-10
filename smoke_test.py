@@ -98,7 +98,7 @@ def _path_without_rg(scratch: Path) -> str:
     return os.pathsep.join(kept)
 
 
-async def _write_search_corpus(session) -> None:
+async def _write_search_corpus(session, vaults: Path) -> None:
     await session.call_tool("create_vault", {"vault": "Searchvault"})
     corpus = [
         ("alpha.md", "the quick brown fox\njumps over the lazy dog\nfox again here\n"),
@@ -110,6 +110,11 @@ async def _write_search_corpus(session) -> None:
             "write_note", {"vault": "Searchvault", "path": path, "content": content}
         )
         assert not res.isError, err_text(res)
+    # Each of these once made rg and the fallback disagree on the "fox" hits.
+    searchvault = vaults / "Searchvault"
+    (searchvault / "notes.txt").write_text("fox in a text file\n", encoding="utf-8")
+    os.symlink("alpha.md", searchvault / "alias.md")
+    (searchvault / ".gitignore").write_text("beta.md\n", encoding="utf-8")
 
 
 async def _collect_search_sets(session) -> dict:
@@ -130,6 +135,7 @@ async def _collect_search_sets(session) -> dict:
         assert res["truncated"] is False, res
         sets[key] = sorted((m["vault"], m["path"], m["line"], m["text"]) for m in res["matches"])
     assert len(sets["plain"]) == 3, sets  # alpha x2 (any case) + beta x1
+    assert {hit[1] for hit in sets["plain"]} == {"alpha.md", "beta.md"}, sets
     assert len(sets["regex"]) == 2, sets
     assert len(sets["casesens"]) == 1, sets
     for limit in (1, 2):
@@ -389,7 +395,7 @@ async def _rg_fallback_only() -> int:
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                await _write_search_corpus(session)
+                await _write_search_corpus(session, vaults)
                 rg_sets = await _collect_search_sets(session)
         await _search_fallback_leg(vaults, rg_sets, Path(temp_dir) / "norgbin")
     print("SMOKE OK (rg-fallback only)")
@@ -579,6 +585,16 @@ async def main() -> int:
                 assert alias_del.isError, "symlink alias was not rejected"
                 assert (vaults / "Aliasvault").is_symlink(), "alias symlink was followed"
                 assert (outer / "sentinel.txt").is_file(), "symlink target was harmed"
+                (outer / "Leak.md").write_text(
+                    "---\ntags: [leak]\n---\nleakword\n", encoding="utf-8"
+                )
+                alias_listed = out(await session.call_tool("list_vaults", {}))
+                assert "Aliasvault" not in {v["name"] for v in alias_listed}, alias_listed
+                all_tags = out(await session.call_tool("list_tags", {}))
+                assert "Aliasvault" not in all_tags, all_tags
+                leak = out(await session.call_tool("search_notes", {"query": "leakword"}))
+                assert leak["matches"] == [], leak
+                (outer / "Leak.md").unlink()
                 (vaults / "Aliasvault").unlink()
                 (outer / "sentinel.txt").unlink()
                 outer.rmdir()
@@ -688,6 +704,16 @@ async def main() -> int:
                 assert broken_out["sha256"] != hashlib.sha256(lossy).hexdigest(), (
                     "sha must not be the hash of the lossy-decoded text"
                 )
+                # Rewrites refuse non-UTF-8 bytes instead of replacing them with U+FFFD.
+                for tool, args in (
+                    ("append_note", {"path": "Broken.md", "text": "x\n"}),
+                    ("move_note", {"src_path": "Broken.md", "dst_path": "Broken2.md"}),
+                ):
+                    refused = await session.call_tool(tool, {"vault": "Termchat", **args})
+                    assert refused.isError, tool
+                    assert "not valid UTF-8" in err_text(refused), err_text(refused)
+                assert (vaults / "Termchat" / "Broken.md").read_bytes() == broken_raw
+                assert not (vaults / "Termchat" / "Broken2.md").exists()
 
                 # CRLF: content is universal-newline normalized, sha is raw bytes.
                 (vaults / "Termchat" / "Crlf.md").write_bytes(b"line1\r\nline2\r\n")
@@ -715,6 +741,22 @@ async def main() -> int:
                     await session.call_tool("read_note", {"vault": "Termchat", "path": "Crlf.md"})
                 )
                 assert crlf_after["content"] == "line1\nline2\nline3\n", repr(crlf_after["content"])
+                crlf_disk = (vaults / "Termchat" / "Crlf.md").read_bytes()
+                assert crlf_disk == b"line1\r\nline2\r\nline3\n", crlf_disk
+
+                lookalike = out(
+                    await session.call_tool(
+                        "write_note",
+                        {
+                            "vault": "Newvault",
+                            "path": "Lookalike.md",
+                            "content": "---\nlast_updated: 2000-01-01\n---\nx\n",
+                        },
+                    )
+                )
+                assert lookalike["updated_refreshed"] is True, lookalike
+                lookalike_text = (vaults / "Newvault" / "Lookalike.md").read_text()
+                assert "\nupdated: " in lookalike_text, lookalike_text
 
                 # Second Runnix match so truncation can be exercised below.
                 await session.call_tool(
@@ -998,6 +1040,18 @@ async def main() -> int:
                     )
                 )
                 assert missing_ok["sha256_before"] is None, missing_ok
+                # Rejected or no-op calls must not leave directories or lock files.
+                bad_suffix = await session.call_tool(
+                    "write_note", {"vault": "Termchat", "path": "nodir/x.txt", "content": "x"}
+                )
+                assert bad_suffix.isError, "non-.md write was not rejected"
+                out(
+                    await session.call_tool(
+                        "delete_note",
+                        {"vault": "Termchat", "path": "nodir/x.md", "missing_ok": True},
+                    )
+                )
+                assert not (vaults / "Termchat" / "nodir").exists()
                 # backlinks follow a move (source path updates on target)
                 await session.call_tool(
                     "write_note",
@@ -1278,7 +1332,7 @@ async def main() -> int:
         async with stdio_client(params_search) as (read, write):
             async with ClientSession(read, write) as search_session:
                 await search_session.initialize()
-                await _write_search_corpus(search_session)
+                await _write_search_corpus(search_session, vaults)
                 rg_sets = await _collect_search_sets(search_session)
         await _search_fallback_leg(vaults, rg_sets, Path(temp_dir) / "norgbin")
 

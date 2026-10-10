@@ -38,7 +38,7 @@ def _vault_root(vault: str) -> Path:
             valid = sorted(
                 d.name
                 for d in config.VAULTS_ROOT.iterdir()
-                if d.is_dir() and not d.name.startswith(".")
+                if d.is_dir() and not d.is_symlink() and not d.name.startswith(".")
             )
         except OSError:
             valid = []
@@ -118,6 +118,14 @@ def _read_note(path: Path) -> tuple[bytes, str]:
 def _read_text(path: Path) -> str:
     """Read a note as UTF-8, replacing invalid bytes instead of crashing."""
     return _read_note(path)[1]
+
+
+def _strict_text(raw: bytes, path: str) -> str:
+    """Decode bytes that will be written back; a lossy decode would corrupt the file."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"note is not valid UTF-8, refusing to rewrite it: {path!r}") from exc
 
 
 @contextlib.contextmanager
@@ -253,7 +261,7 @@ def _refresh_updated(text: str) -> tuple[str, bool]:
     m = FRONTMATTER_RE.match(text)
     if not m:
         return text, False
-    if "updated:" not in m.group(1):
+    if not UPDATED_RE.search(m.group(1)):
         nl = "\r\n" if "\r\n" in m.group(0) else "\n"
         inserted = f"updated: {date.today().isoformat()}{nl}" + m.group(1)
         return text[: m.start(1)] + inserted + text[m.end(1) :], True
@@ -273,6 +281,14 @@ def _resolve_path_link(root: Path, target: str) -> Path | None:
     return confined if confined is not None and confined.is_file() else None
 
 
+def _stem_index(notes: list[Path]) -> dict[str, Path]:
+    """Map each note name to one path; Obsidian resolves duplicates to the shortest."""
+    by_stem: dict[str, Path] = {}
+    for p in sorted(notes, key=lambda q: (len(q.parts), q.as_posix())):
+        by_stem.setdefault(p.stem, p)
+    return by_stem
+
+
 def _resolve_link_fast(root: Path, target: str, by_stem: dict[str, Path]) -> Path | None:
     """Resolve a wiki-link target using a prebuilt stem index."""
     target = target.strip()
@@ -282,63 +298,6 @@ def _resolve_link_fast(root: Path, target: str, by_stem: dict[str, Path]) -> Pat
         return _resolve_path_link(root, target)
     hit = by_stem.get(target)
     return _under_vault(root, hit) if hit is not None else None
-
-
-def _resolve_link(root: Path, target: str) -> Path | None:
-    from vaults.indexes import _all_notes  # deferred: avoids notes<->indexes cycle
-
-    target = target.strip()
-    if not target:
-        return None
-    if "/" in target:
-        return _resolve_path_link(root, target)
-    matches = [
-        confined
-        for p in _all_notes(root)
-        if p.stem == target and (confined := _under_vault(root, p)) is not None
-    ]
-    if not matches:
-        return None
-    # Obsidian resolves duplicate note names to the shortest path.
-    return sorted(matches, key=lambda p: (len(p.parts), p.as_posix()))[0]
-
-
-def _link_info(root: Path, here: Path, text: str) -> tuple[list[str], list[str], list[str]]:
-    from vaults.indexes import _BACKLINK_INDEX, _all_notes, _ensure_indexes
-
-    targets = [t.strip() for t in WIKI_LINK_RE.findall(text) if t.strip()]
-    links, unresolved = [], []
-    for t in targets:
-        hit = _resolve_link(root, t)
-        (links if hit else unresolved).append(t)
-    links, unresolved = sorted(set(links)), sorted(set(unresolved))
-    vault = root.name
-    try:
-        _ensure_indexes(root, vault)
-        rel = _rel(root, here)
-        backlinks = sorted(_BACKLINK_INDEX.get(vault, {}).get(rel, set()))
-    except ValueError:
-        backlinks = sorted(
-            {
-                _rel(root, p)
-                for p in _all_notes(root)
-                if p != here and here in _link_targets(root, p)
-            }
-        )
-    return links, backlinks, unresolved
-
-
-def _link_targets(root: Path, p: Path) -> set[Path]:
-    try:
-        text = _read_text(p)
-    except OSError:
-        return set()
-    out = set()
-    for t in WIKI_LINK_RE.findall(text):
-        hit = _resolve_link(root, t.strip())
-        if hit:
-            out.add(hit)
-    return out
 
 
 def list_vaults() -> list[dict]:
@@ -353,7 +312,7 @@ def list_vaults() -> list[dict]:
             "notes": len(_all_notes(d.resolve())),
         }
         for d in sorted(config.VAULTS_ROOT.iterdir())
-        if d.is_dir() and not d.name.startswith(".")
+        if d.is_dir() and not d.is_symlink() and not d.name.startswith(".")
     ]
 
 
@@ -514,7 +473,7 @@ def list_notes(
 
 
 def read_note(vault: str, path: str) -> dict:
-    from vaults.indexes import _BACKLINK_INDEX, _FRONTMATTER_INDEX, _ensure_indexes
+    from vaults.indexes import _BACKLINK_INDEX, _FRONTMATTER_INDEX, _all_notes, _ensure_indexes
 
     root = _vault_root(vault)
     p = _note_path(root, path)
@@ -531,9 +490,10 @@ def read_note(vault: str, path: str) -> dict:
     else:
         frontmatter = dict(cached_fm)
     targets = [t.strip() for t in WIKI_LINK_RE.findall(text) if t.strip()]
+    by_stem = _stem_index(_all_notes(root))
     links, unresolved = [], []
     for t in targets:
-        hit = _resolve_link(root, t)
+        hit = _resolve_link_fast(root, t, by_stem)
         (links if hit else unresolved).append(t)
     links, unresolved = sorted(set(links)), sorted(set(unresolved))
     backlinks = sorted(_BACKLINK_INDEX.get(vault, {}).get(rel, set()))
@@ -556,8 +516,6 @@ def _write_note_locked(
     from vaults.indexes import _invalidate_vault  # deferred: avoids notes<->indexes cycle
     from vaults.versioning import _git_result  # deferred: avoids notes<->versioning cycle
 
-    if p.suffix != ".md":
-        raise ValueError("note path must end in .md")
     if p.is_dir():
         raise ValueError(f"note path is a directory: {p.name!r}")
     _ensure_utf8(content)
@@ -593,6 +551,8 @@ def write_note(vault: str, path: str, content: str, expected_sha256: str | None 
     _ensure_utf8(content)
     root = _vault_root(vault)
     p = _note_path(root, path)
+    if p.suffix != ".md":
+        raise ValueError("note path must end in .md")
     with _note_lock(p):
         return _write_note_locked(root, p, content, expected_sha256)
 
@@ -604,7 +564,7 @@ def append_note(vault: str, path: str, text: str, expected_sha256: str | None = 
         raise ValueError("note path must end in .md")
     _ensure_utf8(text)
     with _note_lock(p):
-        current = _read_text(p) if p.is_file() else ""
+        current = _strict_text(p.read_bytes(), path) if p.is_file() else ""
         if current and not current.endswith("\n"):
             current += "\n"
         return _write_note_locked(root, p, current + text, expected_sha256, op="append")
@@ -621,6 +581,11 @@ def delete_note(vault: str, path: str, missing_ok: bool = False) -> dict:
     p = _note_path(root, path)
     if p.suffix != ".md":
         raise ValueError("note path must end in .md")
+    # Taking the note lock would create the missing parent directories.
+    if not p.parent.is_dir():
+        if not missing_ok:
+            raise ValueError(f"note not found: {path!r}")
+        return {"vault": vault, "path": path, "sha256_before": None}
     with _note_lock(p):
         if not p.is_file():
             if not missing_ok:
@@ -684,13 +649,14 @@ def move_note(
         if dst.exists():
             raise ValueError(f"destination exists: {dst_path!r}")
         try:
-            previous_raw, previous = _read_note(src)
+            previous_raw = src.read_bytes()
         except OSError as exc:
             raise ValueError(f"note not found: {src_path!r}") from exc
         if expected_sha256 is not None and _sha256_bytes(previous_raw) != expected_sha256:
             raise ValueError(
                 "note has changed since the supplied expected_sha256; read it again before moving"
             )
+        previous = _strict_text(previous_raw, src_path)
         _ensure_utf8(previous)
         dst.parent.mkdir(parents=True, exist_ok=True)
         content, _ = _refresh_updated(previous)

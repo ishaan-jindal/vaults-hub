@@ -11,6 +11,7 @@ from vaults.notes import (
     _rel,
     _resolve_link_fast,
     _split_frontmatter,
+    _stem_index,
     _under_vault,
     _vault_root,
     list_vaults,
@@ -120,9 +121,7 @@ def _all_notes(root: Path) -> list[Path]:
 def _rebuild_indexes(root: Path, vault: str, scan: list[Path]) -> None:
     """Full rebuild of backlink + frontmatter indexes from one scan."""
     with _INDEX_LOCK:
-        by_stem: dict[str, Path] = {}
-        for p in sorted(scan, key=lambda q: (len(q.parts), q.as_posix())):
-            by_stem.setdefault(p.stem, p)
+        by_stem = _stem_index(scan)
         mtimes: dict[str, float] = {}
         fm_index: dict[str, dict] = {}
         targets_map: dict[str, set[Path]] = {}
