@@ -30,6 +30,9 @@ All notable changes to this project will be documented in this file.
   stdin bridge.
 - The release workflow runs the full CI (all Python versions and the
   launcher test) before publishing.
+- Contributors: `smoke_test.py --only=rg-fallback` is gone, since the main run
+  already covers the ripgrep-absent leg, and a release now bumps three version
+  literals instead of six.
 
 ## [0.2.0] - 2026-09-27
 
