@@ -15,6 +15,7 @@ from mcp.client.stdio import stdio_client
 
 HERE = Path(__file__).resolve().parent
 SERVER = HERE / "server.py"
+VERSION = json.loads((HERE / "package.json").read_text(encoding="utf-8"))["version"]
 
 EXPECTED_TOOLS = [
     "append_note",
@@ -412,7 +413,7 @@ async def main() -> int:
                 init = await session.initialize()
                 print("initialized")
                 assert init.serverInfo.name == "vaults", init.serverInfo
-                assert init.serverInfo.version == "0.2.0", init.serverInfo
+                assert init.serverInfo.version == VERSION, init.serverInfo
 
                 listed_tools = (await session.list_tools()).tools
                 tools = sorted(tool.name for tool in listed_tools)
@@ -477,7 +478,7 @@ async def main() -> int:
                     "vaults_root",
                     "vault_count",
                 }, info
-                assert info["version"] == "0.2.0", info
+                assert info["version"] == VERSION, info
                 assert info["git_enabled"] is True, info
                 assert info["vaults_root"] == str(vaults), info
                 assert info["vault_count"] == len(listed), info

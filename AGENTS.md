@@ -54,12 +54,7 @@ If you add a module under `vaults/`, also add it to the tarball file list in `.g
 
 ## Release
 
-1. Bump all six version literals together:
-   - `pyproject.toml`
-   - `package.json`
-   - `vaults/server.py` `SERVER_VERSION`
-   - `vaults/__init__.py` `__version__`
-   - the two version asserts in `smoke_test.py`
+1. Bump all three version literals together: `pyproject.toml`, `package.json`, and `vaults/__init__.py` `__version__` (`SERVER_VERSION` and the smoke test derive from these).
 2. Add a `## [x.y.z]` section to `CHANGELOG.md`.
 3. Commit, then push the tag `v<version>` from the local machine. CI then verifies, publishes to npm via OIDC, and creates the GitHub Release.
 4. Agents never create or push tags without explicit approval.
