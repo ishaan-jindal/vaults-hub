@@ -389,7 +389,9 @@ async def list_tags(
 
 @mcp.tool(
     description=(
-        "Search note contents with ripgrep across one vault or all vaults. "
+        "Search .md note contents with ripgrep across one vault or all vaults. "
+        "regex=True uses ripgrep's Rust syntax (Python re when ripgrep is absent), "
+        "so lookarounds and backreferences are not portable. "
         "limit is clamped 1-200 and the response carries a truncated flag; "
         "before/after (0-10) add context lines. With context each hit keeps "
         "text (= match_line) plus before_lines/match_line/after_lines, "

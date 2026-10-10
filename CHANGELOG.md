@@ -12,6 +12,18 @@ All notable changes to this project will be documented in this file.
   failing the whole listing.
 - Name links to an in-vault symlinked note now resolve to the symlink's target
   file, so backlinks are attributed to the real note.
+- `append_note`, `move_note` and `restore` refuse notes that are not valid
+  UTF-8 instead of silently replacing bytes, and keep CRLF line endings.
+- `search_notes` returns the same results with or without ripgrep: only `.md`
+  notes, no symlinks, and `.gitignore` is no longer honored by either backend.
+- Vault directories that are symlinks are no longer listed, searched across,
+  or counted by `list_tags`; previously one broke `list_tags` for all vaults.
+- `updated_refreshed` no longer reports true when only a look-alike key such
+  as `last_updated:` exists; `updated:` is now inserted.
+- `read_note` resolves wiki-links with one note scan instead of one per link.
+- Rejected `write_note` paths and no-op `delete_note(missing_ok=True)` calls
+  no longer create directories or lock files.
+- npm launcher: concurrent first runs no longer share a half-built venv.
 
 ## [0.2.0] - 2026-09-27
 

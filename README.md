@@ -126,7 +126,7 @@ is gated on `confirm` instead):
 | `delete_note` | M | Delete a note (`missing_ok=True` to tolerate absence); cleans up sibling tmp files (lock files are left in place) |
 | `move_note` | M | Move/rename a note (copy+delete, not atomic); errors if src missing or dst exists; honors `expected_sha256`; refreshes `updated:` |
 | `list_tags` | R | Tag counts per vault from cached frontmatter (one vault or all) |
-| `search_notes` | R | Full-text search via ripgrep (or Python fallback) across one vault or all, with before/after context lines; `limit` 1–200 with a `truncated` flag |
+| `search_notes` | R | Full-text search of `.md` notes via ripgrep (or Python fallback) across one vault or all, with before/after context lines; `limit` 1–200 with a `truncated` flag |
 | `history` | R | Version history for a note (`[{sha, date, message}]`) or whole vault from the local git repo, with a `truncated` flag |
 | `restore` | M | Restore a note from a past revision (snapshots dirty state first; recreates deleted notes); echoes the revision as `restored_from` |
 
@@ -176,8 +176,14 @@ How the server avoids losing or corrupting notes:
   missing git binary or failed commit warns (surfaced as `commit_error`)
   but never blocks the write.
 - **Search parity.** `search_notes` prefers `rg --json` and falls back to
-  pure Python when ripgrep is absent; both sides skip dotfiles and
-  `.obsidian/` so hidden files never leak into results.
+  pure Python when ripgrep is absent; both sides search only `.md` notes,
+  skip dotfiles, `.obsidian/` and symlinks, and ignore `.gitignore`, so
+  results match whichever backend runs. Regex syntax is the exception:
+  ripgrep uses Rust regex, the fallback Python `re`, so lookarounds and
+  backreferences are not portable.
+- **No lossy rewrites.** `append_note`, `move_note` and `restore` refuse
+  content that is not valid UTF-8 instead of replacing bytes, and keep
+  existing CRLF line endings.
 - **No surprise frontmatter.** Notes without a frontmatter block stay that
   way; `updated:` is only refreshed (or inserted) when a block exists.
 - **Fresh indexes.** Backlink/tag indexes are invalidated by mtime, so
@@ -186,6 +192,8 @@ How the server avoids losing or corrupting notes:
   rejected — a link can never pull reads or writes out of the vault.
   Escaping wiki-link path targets (e.g. `[[../Outside.md]]`) are treated as
   unresolved; `list_notes` skips escaping symlink entries instead of failing.
+  A vault directory that is itself a symlink is not listed, searched, or
+  counted in `list_tags`.
 
 ## Configuration
 
@@ -201,7 +209,7 @@ when missing.
 
 Notes:
 
-- **ripgrep is optional.** If `rg` is on `PATH`, `search_notes` uses `rg --json`; otherwise a pure-Python fallback (with minimal `.gitignore` handling) is used. No configuration needed either way.
+- **ripgrep is optional.** If `rg` is on `PATH`, `search_notes` uses `rg --json`; otherwise a pure-Python fallback with the same results is used. No configuration needed either way.
 - **POSIX-only.** File locking uses `fcntl`, so Windows is not supported.
 - **npx launcher.** `VAULTS_HUB_PYTHON` overrides which Python the
   `vaults-hub` bin uses (else `python3`, then `python` on `PATH`;

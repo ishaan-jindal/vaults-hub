@@ -1,6 +1,5 @@
 """Full-text search: ripgrep when available, pure-Python fallback otherwise."""
 
-import fnmatch
 import json
 import re
 import shutil
@@ -9,48 +8,6 @@ from pathlib import Path
 
 from vaults.indexes import _all_notes
 from vaults.notes import _note_path, _read_text, _rel, _vault_root, list_vaults
-
-
-def _gitignore_patterns(root: Path) -> list[str]:
-    gi = root / ".gitignore"
-    if not gi.is_file():
-        return []
-    try:
-        return [
-            ln.strip()
-            for ln in gi.read_text(encoding="utf-8").splitlines()
-            if ln.strip() and not ln.strip().startswith("#")
-        ]
-    except OSError:
-        return []
-
-
-def _gitignored(root: Path, p: Path, patterns: list[str]) -> bool:
-    """Minimal .gitignore matching for the Python search fallback."""
-    rel = _rel(root, p)
-    for raw in patterns:
-        if raw.startswith("!"):
-            continue
-        anchored = raw.startswith("/")
-        pat = raw.lstrip("/")
-        dir_only = pat.endswith("/")
-        pat = pat.rstrip("/")
-        if dir_only:
-            if rel.startswith(pat + "/"):
-                return True
-            continue
-        if "*" not in pat:
-            if anchored:
-                if rel == pat or rel.startswith(pat + "/"):
-                    return True
-            elif pat in rel.split("/"):
-                return True
-        elif anchored:
-            if fnmatch.fnmatch(rel, pat):
-                return True
-        elif any(fnmatch.fnmatch(part, pat) for part in rel.split("/")):
-            return True
-    return False
 
 
 def search_notes(
@@ -94,6 +51,11 @@ def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
         "--json",
         "-n",
         "--no-heading",
+        # WHY: the fallback can only mirror "every non-hidden, non-symlinked .md
+        # note", so ignore files are off and only .md is searched (later globs win).
+        "--no-ignore",
+        "--glob",
+        "*.md",
         "--glob",
         "!**/.obsidian/**",
         "--glob",
@@ -159,8 +121,10 @@ def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
         raise ValueError(f"invalid regular expression: {exc}") from exc
     hits: list[dict] = []
     for root in roots:
-        ignore = _gitignore_patterns(root)
         for p in _all_notes(root):
+            # rg never follows symlinks; any symlinked component changes resolve().
+            if p.resolve() != p:
+                continue
             try:
                 rel = _rel(root, p)
             except ValueError:
@@ -169,8 +133,6 @@ def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
             if any(part.startswith(".") for part in parts):
                 continue
             if ".obsidian" in parts:
-                continue
-            if _gitignored(root, p, ignore):
                 continue
             try:
                 lines = _read_text(p).splitlines()

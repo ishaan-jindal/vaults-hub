@@ -14,7 +14,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -198,24 +198,30 @@ function ensureInterpreter(py) {
 
   // Rebuild. Every message goes to stderr; the first run downloads and
   // installs the pins (~15s), so say plainly it is a one-time cost.
+  // Built in a per-process dir and renamed into place, so concurrent first
+  // launches never share a half-built venv.
+  const buildDir = `${venvDir}.tmp-${process.pid}`;
+  const buildPy = join(buildDir, "bin", "python");
   err(`dependencies missing for ${py.cmd}; setting up a cached venv (one-time, ~15s)...`);
   err(`creating venv at ${venvDir}`);
   try {
     mkdirSync(root, { recursive: true });
     if (existsSync(venvDir)) rmSync(venvDir, { recursive: true, force: true });
+    rmSync(buildDir, { recursive: true, force: true });
   } catch (e) {
     err(`cannot prepare venv directory ${venvDir}: ${e.message}`);
     process.exit(1);
   }
-  const venvRes = runCapture(py.cmd, ["-m", "venv", venvDir]);
+  const venvRes = runCapture(py.cmd, ["-m", "venv", buildDir]);
   if (!venvRes.ok) {
-    err(`failed to create venv at ${venvDir}.`);
+    err(`failed to create venv at ${buildDir}.`);
     if (venvRes.spawnError) err(String(venvRes.spawnError.message ?? venvRes.spawnError));
     if (venvRes.stderr.trim()) err(venvRes.stderr.trim());
+    rmSync(buildDir, { recursive: true, force: true });
     process.exit(1);
   }
   err(`installing pinned dependencies from requirements.txt (one-time cost; reused afterwards)...`);
-  const pipRes = runCapture(venvPy, [
+  const pipRes = runCapture(buildPy, [
     "-m",
     "pip",
     "install",
@@ -229,7 +235,14 @@ function ensureInterpreter(py) {
     if (pipRes.stderr.trim()) err(pipRes.stderr.trim());
     if (pipRes.stdout.trim()) err(pipRes.stdout.trim());
     if (pipRes.spawnError) err(String(pipRes.spawnError.message ?? pipRes.spawnError));
+    rmSync(buildDir, { recursive: true, force: true });
     process.exit(1);
+  }
+  try {
+    renameSync(buildDir, venvDir);
+  } catch {
+    // Another launcher renamed its venv into place first; the probe below vets it.
+    rmSync(buildDir, { recursive: true, force: true });
   }
   const verify = runCapture(venvPy, ["-c", depsProbe()]);
   if (!verify.ok) {

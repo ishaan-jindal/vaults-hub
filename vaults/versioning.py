@@ -319,7 +319,7 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
 
 
 def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None) -> dict:
-    from vaults.notes import _atomic_write, _ensure_utf8
+    from vaults.notes import _atomic_write, _ensure_utf8, _strict_text
 
     root = _vault_root(vault)
     p = _note_path(root, path)
@@ -363,7 +363,7 @@ def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None)
         show = _git_run(root, "show", f"{rev}:{rel}")
         if show.returncode != 0:
             raise ValueError(f"unknown revision or path not in revision: {rev!r} for {path!r}")
-        text = show.stdout.decode("utf-8", errors="replace")
+        text = _strict_text(show.stdout, path)
         _ensure_utf8(text)
         p.parent.mkdir(parents=True, exist_ok=True)
         try:
