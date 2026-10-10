@@ -41,7 +41,7 @@ The two jobs are independent on purpose, so one failure does not hide the other'
 Release procedure, in order:
 
 1. Run the suite locally: `python smoke_test.py` (must exit 0) and, with Node installed, `python npm_launcher_test.py`.
-2. Bump the five version literals together (`pyproject.toml`, `vaults/server.py` `SERVER_VERSION`, `vaults/__init__.py` `__version__`, and the two version asserts in `smoke_test.py`).
+2. Bump the six version literals together (`pyproject.toml`, `package.json`, `vaults/server.py` `SERVER_VERSION`, `vaults/__init__.py` `__version__`, and the two version asserts in `smoke_test.py`). The release workflow fails if the tag disagrees with `package.json`.
 3. Commit + push to main.
 4. Push the `v<version>` tag from your machine (`git push origin v<version>`). Tags are pushed from your machine, never from CI.
 5. CI takes over: the `verify` job re-runs the smoke test, the launcher syntax check, and the tarball file-list assertion; the `publish` job publishes to npm via OIDC trusted publishing; the `release` job creates the GitHub Release with notes extracted from the `CHANGELOG.md` section for that version.
