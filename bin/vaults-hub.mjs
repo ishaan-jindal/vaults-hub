@@ -32,7 +32,7 @@ const MIN_PYTHON = [3, 10];
 // are NOT pinned here: requirements.txt is the single source of truth
 // (parsed below), so bumping a pin there flows into the probe on both the
 // fast path and the post-install verify. This map only records names, and
-// stays correct for future pins via the normalized fallback in buildProbe.
+// stays correct for future pins via the normalized fallback in depsProbe.
 const IMPORT_BY_DIST = { PyYAML: "yaml", anyio: "anyio", mcp: "mcp" };
 
 // Parse only real `name==version` pins from requirements.txt; ignore blank
@@ -60,12 +60,13 @@ function parseRequirementPins() {
   return pins;
 }
 
-// Build the `python -c` probe from parsed pins. Explicit `raise SystemExit`
-// checks (never `assert`) so `python -O` cannot strip the guard; the
-// trailing import proves the modules actually import, not just their
-// metadata. Statements are newline-joined: `if` is a compound statement and
-// cannot follow `;` in a `python -c` one-liner.
-function buildProbe(pins) {
+// Build the `python -c` probe from the requirements.txt pins. Explicit
+// `raise SystemExit` checks (never `assert`) so `python -O` cannot strip the
+// guard; the trailing import proves the modules actually import, not just
+// their metadata. Statements are newline-joined: `if` is a compound statement
+// and cannot follow `;` in a `python -c` one-liner.
+function depsProbe() {
+  const pins = parseRequirementPins();
   const lines = ["import importlib.metadata as _m"];
   for (const [name, version] of pins) {
     lines.push(
@@ -77,10 +78,6 @@ function buildProbe(pins) {
   );
   lines.push(`import ${imports.join(", ")}`);
   return lines.join("\n");
-}
-
-function depsProbe() {
-  return buildProbe(parseRequirementPins());
 }
 
 function err(msg) {
@@ -143,10 +140,6 @@ function probeDeps(pythonCmd) {
   return runCapture(pythonCmd, ["-c", depsProbe()]);
 }
 
-function depsImportable(pythonCmd) {
-  return probeDeps(pythonCmd).ok;
-}
-
 // Cache root for bootstrapped venvs. XDG_CACHE_HOME wins when set,
 // otherwise ~/.cache. Keyed per interpreter minor version below so a
 // 3.11-built venv is never reused by 3.14.
@@ -194,7 +187,7 @@ function ensureInterpreter(py) {
 
   // Silent reuse: venv exists, was built from these exact requirements,
   // and still imports the deps.
-  if (marker === wanted && existsSync(venvPy) && depsImportable(venvPy)) return venvPy;
+  if (marker === wanted && existsSync(venvPy) && probeDeps(venvPy).ok) return venvPy;
 
   // Rebuild. Every message goes to stderr; the first run downloads and
   // installs the pins (~15s), so say plainly it is a one-time cost.
@@ -244,7 +237,7 @@ function ensureInterpreter(py) {
     // Another launcher renamed its venv into place first; the probe below vets it.
     rmSync(buildDir, { recursive: true, force: true });
   }
-  const verify = runCapture(venvPy, ["-c", depsProbe()]);
+  const verify = probeDeps(venvPy);
   if (!verify.ok) {
     err(`venv python at ${venvPy} still cannot import the dependencies.`);
     const detail = (verify.stderr || verify.stdout).trim();
