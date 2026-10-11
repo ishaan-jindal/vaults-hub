@@ -14,14 +14,11 @@ _logger = logging.getLogger("vaults")
 def _setup_logging() -> None:
     """Always log errors to the debug file; VAULTS_HUB_DEBUG=1 adds verbose logging."""
     # The server tells users to check this log on unexpected failures, so it must always exist.
-    _logger.disabled = False
     _logger.propagate = False
     if os.environ.get("VAULTS_HUB_DEBUG") == "1":
         _logger.setLevel(logging.DEBUG)
     else:
         _logger.setLevel(logging.WARNING)
-    if _logger.handlers:
-        return
     try:
         log_dir = Path.home() / ".cache" / "vaults-hub"
         log_dir.mkdir(parents=True, exist_ok=True)

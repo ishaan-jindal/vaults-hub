@@ -30,8 +30,6 @@ UPDATED_RE = re.compile(r"(?m)^updated:[^\r\n]*")
 
 
 def _vault_root(vault: str) -> Path:
-    if not vault:
-        vault = ""
     root = (config.VAULTS_ROOT / vault).resolve()
     if root.parent != config.VAULTS_ROOT or not root.is_dir():
         try:
@@ -60,8 +58,8 @@ def _note_path(root: Path, rel: str) -> Path:
     # hostile local process that swaps symlinks between check and use; the
     # upgrade path is openat2/O_NOFOLLOW-based traversal that never follows
     # an untrusted symlink. Benign multi-process use (editors, sync) is safe.
-    p = (root / rel).resolve()
-    if p != root and root not in p.parents:
+    p = _under_vault(root, root / rel)
+    if p is None:
         raise ValueError(f"path escapes vault: {rel!r}")
     return p
 
@@ -379,44 +377,29 @@ def list_notes(
     offset = max(0, int(offset))
     limit = max(1, min(500, int(limit)))
     if recursive:
-        notes = []
+        combined = []
         for p in sorted(base.rglob("*.md")):
             try:
-                parts = p.resolve().relative_to(root).parts
+                r = p.resolve().relative_to(root)
             except ValueError:
                 continue
-            if any(part.startswith(".") for part in parts):
+            if any(part.startswith(".") for part in r.parts):
                 continue
-            notes.append(p.resolve().relative_to(root).as_posix())
-        total = len(notes)
-        if offset > total:
-            raise ValueError(f"list_notes: offset {offset} out of range (total {total})")
-        page = notes[offset : offset + limit]
-        truncated = total > offset + len(page)
-        return {
-            "vault": vault,
-            "path": path,
-            "dirs": [],
-            "notes": page,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "truncated": truncated,
-            "next_offset": offset + len(page) if truncated else None,
-        }
-    dirs, notes = [], []
-    for p in sorted(base.iterdir()):
-        if p.name.startswith("."):
-            continue
-        try:
-            if p.is_dir():
-                dirs.append(_rel(root, p) + "/")
-            elif p.suffix == ".md":
-                notes.append(_rel(root, p))
-        except ValueError:
-            # Symlink (or other entry) that resolves outside the vault.
-            continue
-    combined = [*dirs, *notes]
+            combined.append(r.as_posix())
+    else:
+        dirs, notes = [], []
+        for p in sorted(base.iterdir()):
+            if p.name.startswith("."):
+                continue
+            try:
+                if p.is_dir():
+                    dirs.append(_rel(root, p) + "/")
+                elif p.suffix == ".md":
+                    notes.append(_rel(root, p))
+            except ValueError:
+                # Symlink (or other entry) that resolves outside the vault.
+                continue
+        combined = [*dirs, *notes]
     total = len(combined)
     if offset > total:
         raise ValueError(f"list_notes: offset {offset} out of range (total {total})")

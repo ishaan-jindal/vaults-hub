@@ -43,7 +43,7 @@ def _pathspec(rel: str) -> str:
     return f":(literal){rel}"
 
 
-# Read-only git subcommands get a shorter timeout and GIT_OPTIONAL_LOCKS=0.
+# Read-only git subcommands run with GIT_OPTIONAL_LOCKS=0 so history never blocks writers.
 _READONLY_CMDS = frozenset({"rev-parse", "log", "ls-files", "show", "status"})
 
 
@@ -55,16 +55,13 @@ def _git_lock(root: Path):
 def _git_run(root: Path, *args: str) -> subprocess.CompletedProcess:
     """Run git in the vault root with per-invocation identity. Never raises."""
     readonly = bool(args) and args[0] in _READONLY_CMDS
-    timeout = 10 if readonly else 30
-    env = None
-    if readonly:
-        env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"} if readonly else None
     try:
         return subprocess.run(
             ["git", *_GIT_IDENTITY, *args],
             cwd=root,
             capture_output=True,
-            timeout=timeout,
+            timeout=30,
             env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -135,11 +132,6 @@ def _git_commit(root: Path, rels: list[str], subject: str, sha_hex: str | None) 
     add = _git_run(root, "add", "--", *specs)
     if add.returncode != 0:
         return add.stderr.decode("utf-8", errors="replace").strip()[:300]
-    status = _git_run(root, "status", "--porcelain", "--", *specs)
-    if status.returncode != 0:
-        return status.stderr.decode("utf-8", errors="replace").strip()[:300] or "git status failed"
-    if not status.stdout.strip():
-        return None
     msg = subject if sha_hex is None else f"{subject}\n\nSha256: {sha_hex}"
     commit = _git_run(root, "commit", "--only", "-m", msg, "--", *specs)
     if commit.returncode != 0:
@@ -147,7 +139,10 @@ def _git_commit(root: Path, rels: list[str], subject: str, sha_hex: str | None) 
             commit.stderr.decode("utf-8", errors="replace")
             + commit.stdout.decode("utf-8", errors="replace")
         ).strip()
-        if "nothing to commit" in err:
+        if any(
+            s in err
+            for s in ("nothing to commit", "no changes added to commit", "nothing added to commit")
+        ):
             return None
         return err[:300] or "git commit failed"
     return None
@@ -174,11 +169,6 @@ def _git_result(root: Path, vault: str, rels: list[str], subject: str, sha_hex: 
     return out
 
 
-def _git_tracked(root: Path, rel: str) -> bool:
-    """True if rel is in the vault repo index. Call only when mode is 'ours'."""
-    return _git_run(root, "ls-files", "--error-unmatch", "--", _pathspec(rel)).returncode == 0
-
-
 def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | None) -> str | None:
     """Commit an untracked note before delete so restore can recover it.
 
@@ -187,7 +177,11 @@ def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | No
     """
     try:
         with _git_lock(root):
-            if _git_mode(root) != "ours" or _git_tracked(root, rel):
+            if (
+                _git_mode(root) != "ours"
+                or _git_run(root, "ls-files", "--error-unmatch", "--", _pathspec(rel)).returncode
+                == 0
+            ):
                 return None
             return _git_commit(root, [rel], f"vaults: track before delete {rel}", sha_hex)
     except Exception as exc:

@@ -28,18 +28,12 @@ def search_notes(
         except re.error as exc:
             raise ValueError(f"invalid regular expression: {exc}") from exc
     roots = [_vault_root(vault)] if vault else [Path(v["path"]) for v in list_vaults()]
-    hits = _collect_hits(roots, query, regex, case_sensitive, limit + 1)
+    search = _search_rg if shutil.which("rg") else _search_fallback
+    hits = search(roots, query, regex, case_sensitive, limit + 1)
     truncated = len(hits) > limit
     hits = hits[:limit]
     _attach_context(hits, roots, before, after)
     return {"query": query, "matches": hits, "limit": limit, "truncated": truncated}
-
-
-def _collect_hits(roots, query, regex, case_sensitive, limit) -> list[dict]:
-    """Collect raw matches via rg, or the Python fallback when rg is absent."""
-    if shutil.which("rg"):
-        return _search_rg(roots, query, regex, case_sensitive, limit)
-    return _search_fallback(roots, query, regex, case_sensitive, limit)
 
 
 def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
