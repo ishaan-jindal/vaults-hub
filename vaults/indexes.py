@@ -1,4 +1,4 @@
-"""Per-vault indexes (lanes A + B). Process-local, mtime-validated, never persisted."""
+"""Per-vault backlink/tag indexes. Process-local, mtime-validated, never persisted."""
 
 import os
 import threading
@@ -23,57 +23,26 @@ _BACKLINK_INDEX: dict[str, dict[str, set[str]]] = {}
 _FRONTMATTER_INDEX: dict[str, dict[str, dict]] = {}
 # vault name -> {relpath: mtime seen at index time}
 _INDEX_MTIMES: dict[str, dict[str, float]] = {}
-# vault name -> cached sorted note list (lane A: rebuild on missing/invalidate)
-_NOTES_CACHE: dict[str, list[Path]] = {}
-# vault name -> {dir relpath: st_mtime_ns} covering every visible directory
-# under the vault; a changed signature forces a rescan so files added or
-# removed by another process (e.g. Obsidian) are noticed without a
-# server-side write.
-_DIR_SIG: dict[str, dict[str, int]] = {}
 
-# Single process-wide lock serializing access to the process-local indexes
-# above (_NOTES_CACHE / _BACKLINK_INDEX / _FRONTMATTER_INDEX / _INDEX_MTIMES).
+# Single process-wide lock serializing access to the process-local indexes above.
 # RLock (not Lock) because _ensure_indexes calls _rebuild_indexes while held.
 _INDEX_LOCK = threading.RLock()
 
 
-def _scan_notes(root: Path) -> list[Path]:
-    """Uncached recursive scan, skipping hidden entries (`.obsidian`, `.trash`) and escapes."""
-    return sorted(
-        p
-        for p in root.rglob("*.md")
-        if not any(part.startswith(".") for part in p.relative_to(root).parts)
-        and _under_vault(root, p) is not None
-    )
+def _all_notes(root: Path) -> list[Path]:
+    """Sorted .md notes under root, skipping hidden entries (`.git`, `.obsidian`, `.trash`).
 
-
-def _dir_signature(root: Path) -> dict[str, int]:
-    """Map every visible directory under root to its st_mtime_ns.
-
-    Hidden dirs (.git, .obsidian, .*) are pruned: they never contain indexed
-    notes, and including .git would force a rescan on every commit.
+    Not cached: a walk that prunes hidden dirs costs about what validating a
+    cache of it would, and is never stale.
     """
-    sig: dict[str, int] = {}
-    try:
-        sig["."] = root.stat().st_mtime_ns
-    except OSError:
-        return sig
-    try:
-        for dirpath, dirnames, _ in os.walk(root, followlinks=False):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            try:
-                rel = Path(dirpath).relative_to(root).as_posix()
-            except ValueError:
-                continue
-            if rel == ".":
-                continue
-            try:
-                sig[rel] = Path(dirpath).stat().st_mtime_ns
-            except OSError:
-                continue
-    except OSError:
-        pass
-    return sig
+    notes = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            p = Path(dirpath, name)
+            if name.endswith(".md") and not name.startswith(".") and _under_vault(root, p):
+                notes.append(p)
+    return sorted(notes)
 
 
 def _invalidate_vault(vault: str) -> None:
@@ -82,41 +51,6 @@ def _invalidate_vault(vault: str) -> None:
         _INDEX_MTIMES.pop(vault, None)
         _BACKLINK_INDEX.pop(vault, None)
         _FRONTMATTER_INDEX.pop(vault, None)
-        _NOTES_CACHE.pop(vault, None)
-        _DIR_SIG.pop(vault, None)
-
-
-def _all_notes(root: Path) -> list[Path]:
-    """Cached note listing. Rebuilt when the directory signature changes.
-
-    Writers invalidate explicitly via _invalidate_vault, so a new path
-    written through write/append/delete/move always triggers a rescan; files
-    added or removed by another process change a directory mtime, which the
-    per-directory signature notices. Returns a copy so callers cannot mutate
-    the cache.
-    """
-    # ponytail: mtime-based invalidation can miss same-nanosecond edits (and
-    # filesystems with coarse timestamp granularity); an OS watcher
-    # (inotify/FSEvents) or content-hash validation is the upgrade path if
-    # that ever matters.
-    vault = root.name
-    with _INDEX_LOCK:
-        cached = _NOTES_CACHE.get(vault)
-        sig_cached = _DIR_SIG.get(vault)
-    if cached is not None and sig_cached is not None:
-        try:
-            if _dir_signature(root) == sig_cached and all(p.is_file() for p in cached):
-                return list(cached)
-        except OSError:
-            pass
-    fresh = _scan_notes(root)
-    with _INDEX_LOCK:
-        _NOTES_CACHE[vault] = list(fresh)
-        try:
-            _DIR_SIG[vault] = _dir_signature(root)
-        except OSError:
-            _DIR_SIG.pop(vault, None)
-    return list(fresh)
 
 
 def _rebuild_indexes(root: Path, vault: str, scan: list[Path]) -> None:
@@ -164,19 +98,16 @@ def _rebuild_indexes(root: Path, vault: str, scan: list[Path]) -> None:
         _BACKLINK_INDEX[vault] = backlinks
         _FRONTMATTER_INDEX[vault] = fm_index
         _INDEX_MTIMES[vault] = mtimes
-        _NOTES_CACHE[vault] = list(scan)
-        try:
-            _DIR_SIG[vault] = _dir_signature(root)
-        except OSError:
-            _DIR_SIG.pop(vault, None)
 
 
 def _ensure_indexes(root: Path, vault: str) -> None:
     """Rebuild the vault's indexes unless its note set and every note mtime are unchanged.
 
-    _all_notes notices added/removed notes via the directory signature; the
-    per-file mtimes catch in-place edits, including ones by another process.
+    Comparing {relpath: mtime} catches added, removed, and edited notes,
+    including changes made by another process.
     """
+    # ponytail: mtime validation can miss same-timestamp edits on filesystems
+    # with coarse granularity; content hashing or inotify is the upgrade path.
     notes = _all_notes(root)
     with _INDEX_LOCK:
         mt = _INDEX_MTIMES.get(vault)
