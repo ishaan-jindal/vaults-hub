@@ -4,7 +4,6 @@ import os
 import re
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 from vaults.config import _git_enabled, _logger
@@ -129,23 +128,9 @@ def _git_commit(root: Path, rels: list[str], subject: str, sha_hex: str | None) 
 
     Skips the commit when there is nothing to commit. Fail-open by contract:
     callers surface the error string; the file write always stands.
-    Retries the whole add/status/commit sequence up to 3 times when the
-    failure mentions index.lock (concurrent git writers); never deletes
-    .git/index.lock directly. Callers must hold _git_lock(root).
+    Callers must hold _git_lock(root), which serializes this server's own
+    git writers, so an index.lock conflict only comes from an outside git.
     """
-    backoffs = (0.2, 0.5)
-    err: str | None = None
-    for attempt in range(3):
-        err = _git_commit_once(root, rels, subject, sha_hex)
-        if err is None or "index.lock" not in err:
-            return err
-        if attempt < 2:
-            time.sleep(backoffs[attempt])
-    return err
-
-
-def _git_commit_once(root: Path, rels: list[str], subject: str, sha_hex: str | None) -> str | None:
-    """Single add/status/commit attempt. Callers must hold _git_lock(root)."""
     specs = [_pathspec(r) for r in rels]
     add = _git_run(root, "add", "--", *specs)
     if add.returncode != 0:
