@@ -187,7 +187,8 @@ How the server avoids losing or corrupting notes:
 - **No surprise frontmatter.** Notes without a frontmatter block stay that
   way; `updated:` is only refreshed (or inserted) when a block exists.
 - **Fresh indexes.** Backlink/tag indexes are invalidated by mtime, so
-  external edits are picked up on the next read.
+  external edits are picked up on the next read. Like listings and search,
+  they skip notes in hidden folders such as `.obsidian/` and `.trash/`.
 - **Symlink confinement.** Symlink targets resolving outside the vault are
   rejected — a link can never pull reads or writes out of the vault.
   Escaping wiki-link path targets (e.g. `[[../Outside.md]]`) are treated as
@@ -266,7 +267,7 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 14 tools) <
   `indexes.py` (in-memory backlink/frontmatter indexes with mtime-based
   invalidation), `search.py` (ripgrep + Python-fallback search),
   `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 14
-  tools, stdio bridge). Root `server.py` is a thin shim so `python
+  tools). Root `server.py` is a thin shim so `python
   server.py` keeps working.
 - `server.py` keeps the event loop responsive: every tool runs its blocking
   library call in a worker thread via `anyio.to_thread`. Errors are

@@ -1,29 +1,24 @@
 """FastMCP stdio server: thin @mcp.tool wrappers over the vaults package."""
 
-import asyncio
 import functools
 import platform
 import shutil
 import sys
-import threading
 from collections.abc import Callable
 from typing import Annotated, Any
 
 import anyio
-import mcp.types as mcp_types
 from mcp.server.fastmcp import FastMCP
-from mcp.shared.message import SessionMessage
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from vaults import __version__ as SERVER_VERSION
 from vaults import config
 from vaults import indexes as _indexes
 from vaults import notes as _notes
 from vaults import search as _search
 from vaults import versioning as _versioning
-from vaults.config import _logged, _parse_args, _resolve_vaults_root
-
-SERVER_VERSION = "0.2.0"  # keep in sync with pyproject.toml [project] version
+from vaults.config import _logger, _parse_args, _resolve_vaults_root
 
 mcp = FastMCP(
     "vaults",
@@ -40,49 +35,27 @@ mcp = FastMCP(
 mcp._mcp_server.version = SERVER_VERSION  # noqa: SLF001 - FastMCP's protocol server
 
 
-_logged_calls: dict[str, Callable] = {}
+async def _run_off_loop(tool_name: str, fn: Callable, /, **kwargs: Any) -> Any:
+    """Run a blocking core call in a worker thread; log it and sanitize unexpected errors.
 
-
-def _logged_core(tool_name: str, fn: Callable) -> Callable:
-    """Wrap a sync core function with config._logged under the tool's name.
-
-    _logged is a sync decorator (it must stay that way: FastMCP calls sync
-    tool functions directly in the event loop), so it wraps the blocking core
-    callable that runs in a worker thread, not the async tool itself. The
-    alias keeps log lines reading ``vaults.<tool>`` and preserves the vault /
-    path-only logging plus the full failure traceback.
+    Only vault and path are logged, never content. ValueError passes through
+    unchanged (core ValueErrors are client-safe, including the expected_sha256
+    conflict wording). Anything else becomes a ValueError with no paths or
+    internals; every failure's full traceback goes to the server log.
     """
-    logged = _logged_calls.get(tool_name)
-    if logged is None:
-
-        @functools.wraps(fn)
-        def alias(*args: Any, **kwargs: Any) -> Any:
-            return fn(*args, **kwargs)
-
-        alias.__name__ = tool_name
-        alias.__qualname__ = tool_name
-        logged = _logged(alias)
-        _logged_calls[tool_name] = logged
-    return logged
-
-
-async def _run_off_loop(tool_name: str, fn: Callable, /, *args: Any, **kwargs: Any) -> Any:
-    """Run a blocking core call in a worker thread; sanitize unexpected errors.
-
-    ValueError passes through unchanged (core ValueErrors are client-safe,
-    including the expected_sha256 conflict wording). Anything else becomes a
-    ValueError with no paths or internals; the full traceback is already in
-    the server log via _logged.
-    """
-    call = functools.partial(_logged_core(tool_name, fn), *args, **kwargs)
+    path = kwargs.get("path", kwargs.get("src_path"))
+    _logger.info("vaults.%s called vault=%r path=%r", tool_name, kwargs.get("vault"), path)
     try:
-        return await anyio.to_thread.run_sync(call)
-    except ValueError:
-        raise
+        result = await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
     except Exception as exc:
+        _logger.error("vaults.%s failed", tool_name, exc_info=True)
+        if isinstance(exc, ValueError):
+            raise
         raise ValueError(
             f"{tool_name} failed: {type(exc).__name__}: check the server log for details"
         ) from exc
+    _logger.info("vaults.%s ok", tool_name)
+    return result
 
 
 @mcp.tool(
@@ -155,9 +128,6 @@ async def list_notes(
     offset: Annotated[int, Field(ge=0, description="Skip this many entries")] = 0,
     limit: Annotated[int, Field(ge=1, le=500, description="Max entries (default 200)")] = 200,
 ) -> dict:
-    limit = max(1, min(500, limit))
-    if offset < 0:
-        raise ValueError(f"list_notes: offset {offset} out of range")
     return await _run_off_loop(
         "list_notes",
         _notes.list_notes,
@@ -331,7 +301,6 @@ async def history(
     | None = None,
     limit: Annotated[int, Field(ge=1, le=200, description="Max commits (default 50)")] = 50,
 ) -> dict:
-    limit = max(1, min(200, limit))
     return await _run_off_loop("history", _versioning.history, vault=vault, path=path, limit=limit)
 
 
@@ -460,79 +429,10 @@ def _collect_server_info() -> dict:
     }
 
 
-async def _serve_stdio() -> None:
-    """Run MCP over stdio without AnyIO's broken wrapped-file iterator.
-
-    The project runtime's AnyIO version blocks forever when iterating an
-    ``anyio.wrap_file(TextIOWrapper(sys.stdin.buffer))`` stream. The official
-    MCP stdio adapter relies on that operation, so we bridge blocking stdio
-    reads through a standard-library thread while leaving MCP protocol handling
-    to the SDK.
-    """
-    read_sender, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](32)
-    write_sender, write_stream = anyio.create_memory_object_stream[SessionMessage](32)
-
-    async def write_stdout() -> None:
-        async with write_stream:
-            async for session_message in write_stream:
-                payload = (
-                    session_message.message.model_dump_json(by_alias=True, exclude_none=True) + "\n"
-                )
-                _write_stdout(payload)
-
-    async with anyio.create_task_group() as task_group:
-        _start_stdin_bridge(asyncio.get_running_loop(), read_sender)
-        task_group.start_soon(write_stdout)
-        try:
-            # Pinned to mcp==1.30.0 (see requirements.txt): this uses the
-            # private mcp._mcp_server protocol server plus the custom stdin
-            # bridge above, because this runtime's AnyIO build hangs iterating
-            # a wrapped stdin file. Keep the pin; upgrading the SDK may change
-            # or remove this private API.
-            await mcp._mcp_server.run(  # noqa: SLF001 - FastMCP's protocol server
-                read_stream,
-                write_sender,
-                mcp._mcp_server.create_initialization_options(),
-            )
-        finally:
-            await write_sender.aclose()
-            task_group.cancel_scope.cancel()
-
-
-def _write_stdout(payload: str) -> None:
-    sys.stdout.write(payload)
-    sys.stdout.flush()
-
-
-def _start_stdin_bridge(
-    event_loop: asyncio.AbstractEventLoop,
-    sender: anyio.abc.ObjectSendStream[SessionMessage | Exception],
-) -> None:
-    """Forward stdin in a stdlib thread, since AnyIO worker threads hang here."""
-
-    def forward() -> None:
-        try:
-            for line in sys.stdin.buffer:
-                try:
-                    item: SessionMessage | Exception = SessionMessage(
-                        mcp_types.JSONRPCMessage.model_validate_json(line)
-                    )
-                except Exception as exc:
-                    item = exc
-                asyncio.run_coroutine_threadsafe(sender.send(item), event_loop).result()
-        finally:
-            try:
-                asyncio.run_coroutine_threadsafe(sender.aclose(), event_loop).result()
-            except RuntimeError:
-                pass
-
-    threading.Thread(target=forward, name="mcp-stdin", daemon=True).start()
-
-
 def main(argv=None) -> None:
     """Entry point: resolve the vaults root, then serve MCP over stdio."""
     config.VAULTS_ROOT = _resolve_vaults_root(_parse_args(argv).vaults_root)
-    anyio.run(_serve_stdio)
+    mcp.run()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,6 @@
 """Runtime configuration: vaults root, env switches, logging, CLI args."""
 
 import argparse
-import functools
-import inspect
 import logging
 import os
 from logging.handlers import RotatingFileHandler
@@ -35,31 +33,6 @@ def _setup_logging() -> None:
 
 
 _setup_logging()
-
-
-def _logged(fn):
-    """Log tool entry/exit at INFO and failures at ERROR with traceback."""
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        try:
-            bound = inspect.signature(fn).bind_partial(*args, **kwargs)
-            vault = bound.arguments.get("vault")
-            params = bound.arguments
-            path = params.get("path", params.get("src_path"))
-        except (TypeError, ValueError):
-            vault = kwargs.get("vault", args[0] if args else None)
-            path = kwargs.get("path", kwargs.get("src_path"))
-        _logger.info("vaults.%s called vault=%r path=%r", fn.__name__, vault, path)
-        try:
-            result = fn(*args, **kwargs)
-        except Exception:
-            _logger.error("vaults.%s failed", fn.__name__, exc_info=True)
-            raise
-        _logger.info("vaults.%s ok", fn.__name__)
-        return result
-
-    return wrapper
 
 
 def _git_enabled() -> bool:

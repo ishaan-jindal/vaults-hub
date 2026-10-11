@@ -15,6 +15,7 @@ from mcp.client.stdio import stdio_client
 
 HERE = Path(__file__).resolve().parent
 SERVER = HERE / "server.py"
+VERSION = json.loads((HERE / "package.json").read_text(encoding="utf-8"))["version"]
 
 EXPECTED_TOOLS = [
     "append_note",
@@ -317,7 +318,7 @@ async def _concurrency_leg(vaults: Path) -> None:
 async def _error_log_leg(vaults: Path, temp_dir: str) -> None:
     """The debug log exists by default: a failing tool call must create it.
 
-    _logged records every tool failure at ERROR with a traceback (ValueError
+    _run_off_loop logs every tool failure at ERROR with a traceback (ValueError
     client errors included), so any isError call through a server whose HOME
     points at a scratch dir must leave fakehome/.cache/vaults-hub/debug.log
     with a traceback. The non-ValueError sanitization wording is pinned by the
@@ -376,32 +377,6 @@ async def _error_log_leg(vaults: Path, temp_dir: str) -> None:
     print("error log OK")
 
 
-async def _rg_fallback_only() -> int:
-    """Standalone entry for the CI ripgrep-absent step (same leg, own root)."""
-    with tempfile.TemporaryDirectory(prefix="vaults-hub-norg-") as temp_dir:
-        vaults = Path(temp_dir)
-        fake_home = Path(temp_dir) / ".fakehome-rgonly"
-        (fake_home / ".cache").mkdir(parents=True, exist_ok=True)
-        params = StdioServerParameters(
-            command=sys.executable,
-            args=[str(SERVER)],
-            env={
-                "VAULTS_ROOT": str(vaults),
-                "PYTHONUNBUFFERED": "1",
-                "HOME": str(fake_home),
-                "XDG_CACHE_HOME": str(fake_home / ".cache"),
-            },
-        )
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                await _write_search_corpus(session, vaults)
-                rg_sets = await _collect_search_sets(session)
-        await _search_fallback_leg(vaults, rg_sets, Path(temp_dir) / "norgbin")
-    print("SMOKE OK (rg-fallback only)")
-    return 0
-
-
 def write_fixture(root: Path) -> None:
     (root / "Termchat").mkdir()
     (root / "Runnix").mkdir()
@@ -438,7 +413,7 @@ async def main() -> int:
                 init = await session.initialize()
                 print("initialized")
                 assert init.serverInfo.name == "vaults", init.serverInfo
-                assert init.serverInfo.version == "0.2.0", init.serverInfo
+                assert init.serverInfo.version == VERSION, init.serverInfo
 
                 listed_tools = (await session.list_tools()).tools
                 tools = sorted(tool.name for tool in listed_tools)
@@ -503,7 +478,7 @@ async def main() -> int:
                     "vaults_root",
                     "vault_count",
                 }, info
-                assert info["version"] == "0.2.0", info
+                assert info["version"] == VERSION, info
                 assert info["git_enabled"] is True, info
                 assert info["vaults_root"] == str(vaults), info
                 assert info["vault_count"] == len(listed), info
@@ -960,10 +935,16 @@ async def main() -> int:
                         "content": "---\ntags: d\n---\nbody\n",
                     },
                 )
+                # Notes in hidden folders (Obsidian's .trash) feed neither tags nor backlinks.
+                (vaults / "Termchat" / ".trash").mkdir()
+                (vaults / "Termchat" / ".trash" / "Old.md").write_text(
+                    "---\ntags: [trashed]\n---\n[[TagList]]\n", encoding="utf-8"
+                )
                 tag_counts = out(await session.call_tool("list_tags", {"vault": "Termchat"}))
                 assert tag_counts["Termchat"].get("a/b") == 1, tag_counts
                 assert tag_counts["Termchat"].get("c") == 1, tag_counts
                 assert tag_counts["Termchat"].get("d") == 1, tag_counts
+                assert "trashed" not in tag_counts["Termchat"], tag_counts
                 tag_str = out(
                     await session.call_tool("read_note", {"vault": "Termchat", "path": "TagStr.md"})
                 )
@@ -974,6 +955,7 @@ async def main() -> int:
                     )
                 )
                 assert tag_list["frontmatter"]["tags"] == ["a/b", "c"], tag_list
+                assert tag_list["backlinks"] == [], tag_list
 
                 # E: search context
                 ctx_body = "l1\nl2\nl3 target\nl4\nl5\n"
@@ -1347,8 +1329,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        if sys.argv[1:] == ["--only=rg-fallback"]:
-            raise SystemExit(asyncio.run(_rg_fallback_only()))
-        raise SystemExit(f"usage: {sys.argv[0]} [--only=rg-fallback]")
     raise SystemExit(asyncio.run(main()))

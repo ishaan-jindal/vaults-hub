@@ -1,7 +1,5 @@
 """Per-vault git versioning. One repo per vault, local-only (never push/fetch)."""
 
-import contextlib
-import hashlib
 import os
 import re
 import shutil
@@ -10,8 +8,18 @@ import time
 from pathlib import Path
 
 from vaults.config import _git_enabled, _logger
-from vaults.indexes import _INDEX_LOCK, _invalidate_vault
-from vaults.notes import _note_lock, _note_path, _rel, _vault_root
+from vaults.indexes import _invalidate_vault
+from vaults.notes import (
+    _atomic_write,
+    _ensure_utf8,
+    _flock,
+    _note_lock,
+    _note_path,
+    _rel,
+    _sha256_bytes,
+    _strict_text,
+    _vault_root,
+)
 
 # Per-invocation identity so we never touch the user's gitconfig.
 _GIT_IDENTITY = [
@@ -24,8 +32,6 @@ _GIT_IDENTITY = [
 ]
 # Written to $GIT_DIR/info/exclude (never a visible .gitignore).
 _GIT_EXCLUDES = [".obsidian/", ".*.lock", ".*.tmp"]
-# vault name -> "ours" | "external" | "disabled" (process-local cache).
-_GIT_MODE: dict[str, str] = {}
 
 
 def _pathspec(rel: str) -> str:
@@ -43,21 +49,9 @@ def _pathspec(rel: str) -> str:
 _READONLY_CMDS = frozenset({"rev-parse", "log", "ls-files", "show", "status"})
 
 
-@contextlib.contextmanager
 def _git_lock(root: Path):
     """Serialize git operations per vault via a lock file next to the repo."""
-    try:
-        import fcntl  # POSIX-only; same import style as vaults.notes.
-    except ImportError as exc:
-        raise RuntimeError("vaults-hub requires POSIX fcntl (unavailable on Windows)") from exc
-    lock_path = root / ".vaults-hub-git.lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    return _flock(root / ".vaults-hub-git.lock")
 
 
 def _git_run(root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -98,37 +92,14 @@ def _git_ensure_excludes(root: Path) -> None:
         pass
 
 
-def _git_cached_valid(root: Path, cached: str) -> bool:
-    """True if the cached mode still matches the .git on disk.
-
-    An externally created/removed vault-root .git flips validity without a
-    full rescan (rev-parse) on every call.
-    """
-    try:
-        has_git = (root / ".git").exists()
-    except OSError:
-        return True
-    if cached == "ours":
-        return has_git
-    return not has_git
-
-
-def _git_mode(root: Path, vault: str) -> str:
+def _git_mode(root: Path) -> str:
     """Return 'ours', 'external', or 'disabled', lazily initing one repo per vault.
 
-    Call on mutation paths while holding the note's fcntl lock. Only the
-    process-local cache touches _INDEX_LOCK; never held across git subprocesses.
+    Call on mutation paths while holding the note's fcntl lock.
     """
     if not _git_enabled() or shutil.which("git") is None:
         return "disabled"
-    with _INDEX_LOCK:
-        cached = _GIT_MODE.get(vault)
-    if cached is not None and _git_cached_valid(root, cached):
-        return cached
-    mode = _git_detect(root)
-    with _INDEX_LOCK:
-        _GIT_MODE[vault] = mode
-    return mode
+    return _git_detect(root)
 
 
 def _git_detect(root: Path) -> str:
@@ -204,7 +175,7 @@ def _git_result(root: Path, vault: str, rels: list[str], subject: str, sha_hex: 
     """
     try:
         with _git_lock(root):
-            mode = _git_mode(root, vault)
+            mode = _git_mode(root)
             if mode != "ours":
                 return {"versioning": mode}
             err = _git_commit(root, rels, subject, sha_hex)
@@ -230,7 +201,7 @@ def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | No
     """
     try:
         with _git_lock(root):
-            if _git_mode(root, vault) != "ours" or _git_tracked(root, rel):
+            if _git_mode(root) != "ours" or _git_tracked(root, rel):
                 return None
             return _git_commit(root, [rel], f"vaults: track before delete {rel}", sha_hex)
     except Exception as exc:
@@ -238,16 +209,12 @@ def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | No
         return str(exc)[:200]
 
 
-def _git_read_mode(root: Path, vault: str) -> str:
+def _git_read_mode(root: Path) -> str:
     """Read-only mode probe for history: never inits a repo ('none' if absent)."""
     if not _git_enabled():
         return "disabled"
     if shutil.which("git") is None:
         return "missing"
-    with _INDEX_LOCK:
-        cached = _GIT_MODE.get(vault)
-    if cached is not None and _git_cached_valid(root, cached):
-        return cached
     if (root / ".git").exists():
         return "ours"
     if _git_run(root, "rev-parse", "--git-dir").returncode == 0:
@@ -277,7 +244,7 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
     # Read-only: no locks taken, so history never blocks writers. The git
     # calls run with GIT_OPTIONAL_LOCKS=0 (see _git_run); a concurrent
     # commit may make the read fail, surfaced as ValueError below.
-    mode = _git_read_mode(root, vault)
+    mode = _git_read_mode(root)
     if mode in ("disabled", "missing", "external"):
         raise ValueError(_git_mode_error(mode))
     if rel is not None and (mode == "none" or not _git_tracked(root, rel)):
@@ -319,8 +286,6 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
 
 
 def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None) -> dict:
-    from vaults.notes import _atomic_write, _ensure_utf8, _strict_text
-
     root = _vault_root(vault)
     p = _note_path(root, path)
     if p.suffix != ".md":
@@ -338,7 +303,7 @@ def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None)
     # git calls run lock-free with GIT_OPTIONAL_LOCKS=0.
     with _note_lock(p):
         try:
-            mode = _git_mode(root, vault)
+            mode = _git_mode(root)
         except Exception as exc:
             raise ValueError(f"versioning unavailable: {exc}") from exc
         if mode != "ours":
@@ -348,7 +313,7 @@ def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None)
             current = p.read_bytes() if p.is_file() else None
         except OSError as exc:
             raise ValueError(f"note not found: {path!r}") from exc
-        current_sha = hashlib.sha256(current).hexdigest() if current is not None else None
+        current_sha = _sha256_bytes(current) if current is not None else None
         if expected_sha256 is not None and expected_sha256 != current_sha:
             raise ValueError(
                 "note has changed since the supplied expected_sha256;"
@@ -373,7 +338,7 @@ def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None)
                 f"cannot restore {path!r}: {exc.strerror or type(exc).__name__}"
             ) from exc
         encoded = text.encode("utf-8")
-        new_sha = hashlib.sha256(encoded).hexdigest()
+        new_sha = _sha256_bytes(encoded)
         with _git_lock(root):
             commit_err = _git_commit(root, [rel], f"vaults: restore {rel} from {rev}", new_sha)
         versioning: dict = {"versioning": "ok"}
