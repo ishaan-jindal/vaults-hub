@@ -56,27 +56,12 @@ jobs:
           # Release jobs must not restore caches: cache poisoning is the
           # documented risk to OIDC token exposure.
           package-manager-cache: false
-      # ------------------------------------------------------------------
-      # First-publish limitation: npm's OIDC trusted publishing cannot create
-      # a brand-new package name, because the Trusted Publisher config lives
-      # on the package's npm settings page, which does not exist until the
-      # package does. So 0.2.0 is published manually once from a laptop with
-      # `npm publish`; then the Trusted Publisher is configured on npmjs.com
-      # (user `ishaan-jindal`, repo `vaults-hub`, workflow filename
-      # `release.yml`, environment blank). From 0.3.0 on this workflow works
-      # unchanged. The npm-side fields are case-sensitive and validated only
-      # at publish time, where a mismatch surfaces as a confusing E404 rather
-      # than an auth error. There is deliberately no token-based fallback here.
-      # ------------------------------------------------------------------
       - name: Publish to npm
         # Provenance is automatic under trusted publishing from a public repo
         # plus a public package, so no --provenance flag and no NODE_AUTH_TOKEN.
-        #
-        # Bootstrap case: 0.2.0 must be published by hand before the tag is
-        # pushed, so re-publishing it here fails with EPUBLISHCONFLICT. An
-        # exact version already sitting on the registry is the desired end
-        # state, not a failure -- treat it as success so the run stays green
-        # and the GitHub Release step still runs.
+        # A Trusted Publisher mismatch on npmjs.com surfaces as a confusing E404.
+        # The exact version already on the registry counts as success, so a
+        # re-run after a failed release step still creates the GitHub Release.
         run: |
           set -euo pipefail
           PKG_VERSION="$(node -p "require('./package.json').version")"
