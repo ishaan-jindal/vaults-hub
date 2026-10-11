@@ -30,8 +30,6 @@ UPDATED_RE = re.compile(r"(?m)^updated:[^\r\n]*")
 
 
 def _vault_root(vault: str) -> Path:
-    if not vault:
-        vault = ""
     root = (config.VAULTS_ROOT / vault).resolve()
     if root.parent != config.VAULTS_ROOT or not root.is_dir():
         try:
@@ -60,8 +58,8 @@ def _note_path(root: Path, rel: str) -> Path:
     # hostile local process that swaps symlinks between check and use; the
     # upgrade path is openat2/O_NOFOLLOW-based traversal that never follows
     # an untrusted symlink. Benign multi-process use (editors, sync) is safe.
-    p = (root / rel).resolve()
-    if p != root and root not in p.parents:
+    p = _under_vault(root, root / rel)
+    if p is None:
         raise ValueError(f"path escapes vault: {rel!r}")
     return p
 
@@ -82,11 +80,6 @@ def _sha256_bytes(data: bytes) -> str:
     # delete/move agree even for non-UTF-8 files whose lossy errors="replace"
     # decode would otherwise hash different bytes than what is stored.
     return hashlib.sha256(data).hexdigest()
-
-
-def _sha256(text: str) -> str:
-    """Hash content being written; its UTF-8 encoding is exactly what lands on disk."""
-    return _sha256_bytes(text.encode("utf-8"))
 
 
 def _ensure_utf8(content: str) -> None:
@@ -113,11 +106,6 @@ def _read_note(path: Path) -> tuple[bytes, str]:
     if "\r" in text:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
     return raw, text
-
-
-def _read_text(path: Path) -> str:
-    """Read a note as UTF-8, replacing invalid bytes instead of crashing."""
-    return _read_note(path)[1]
 
 
 def _strict_text(raw: bytes, path: str) -> str:
@@ -205,34 +193,14 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _normalize_tags(value) -> list[str]:
-    """Coerce frontmatter `tags` to a sorted list[str].
-
-    Accepts a YAML string or list (documents the string form explicitly):
-    - plain string with no comma/brackets (e.g. ``d``) -> ``["d"]``
-    - comma-separated or bracketed string -> split on commas
-    - list -> coerce each item to str
-    Empty/missing -> ``[]``.
-    """
+    """Coerce frontmatter `tags` (YAML list, `a, b` string, or scalar) to a sorted list[str]."""
     if value is None:
         return []
     if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return []
-        if "," not in s and "[" not in s and "]" not in s:
-            return [s]
-        inner = s.strip().strip("[]")
-        parts = [p.strip().strip("'\"") for p in inner.split(",")]
-        return sorted(p for p in parts if p)
-    if isinstance(value, list):
-        out = []
-        for item in value:
-            t = str(item).strip()
-            if t:
-                out.append(t)
-        return sorted(out)
-    s = str(value).strip()
-    return [s] if s else []
+        value = value.split(",")
+    elif not isinstance(value, list):
+        value = [value]
+    return sorted(t for t in (str(v).strip() for v in value) if t)
 
 
 def _normalize_frontmatter(data: dict) -> dict:
@@ -385,19 +353,11 @@ def delete_vault(vault: str, confirm: str) -> dict:
     notes_removed = len(_all_notes(target))
     git_history = "removed" if (target / ".git").exists() else "none"
 
-    trash = config.VAULTS_ROOT / f".{name}.deleted-{os.getpid()}"
-    n = 0
-    while trash.exists():
-        n += 1
-        trash = config.VAULTS_ROOT / f".{name}.deleted-{os.getpid()}.{n}"
-    # ponytail: rename cuts the vault out of the namespace atomically so rivals see
-    # "unknown vault" not ENOENT; _git_lock is belt-and-braces (its file dies with the
-    # tree) and a crash leaves a hidden `.name.deleted-<pid>` dir that list_vaults
-    # filters out and we deliberately never auto-clean.
+    # ponytail: rmtree in place, so a concurrent call or a crash mid-delete can see
+    # a partially deleted vault; rename to a hidden dir first if that ever matters.
     with _git_lock(target):
-        os.rename(target, trash)
+        shutil.rmtree(target)
         _invalidate_vault(name)
-        shutil.rmtree(trash)
     return {
         "vault": name,
         "path": str(target),
@@ -417,46 +377,29 @@ def list_notes(
     offset = max(0, int(offset))
     limit = max(1, min(500, int(limit)))
     if recursive:
-        notes = []
+        combined = []
         for p in sorted(base.rglob("*.md")):
             try:
-                parts = p.resolve().relative_to(root).parts
+                r = p.resolve().relative_to(root)
             except ValueError:
                 continue
-            if ".obsidian" in parts:
+            if any(part.startswith(".") for part in r.parts):
                 continue
-            if any(part.startswith(".") for part in parts):
+            combined.append(r.as_posix())
+    else:
+        dirs, notes = [], []
+        for p in sorted(base.iterdir()):
+            if p.name.startswith("."):
                 continue
-            notes.append(p.resolve().relative_to(root).as_posix())
-        total = len(notes)
-        if offset > total:
-            raise ValueError(f"list_notes: offset {offset} out of range (total {total})")
-        page = notes[offset : offset + limit]
-        truncated = total > offset + len(page)
-        return {
-            "vault": vault,
-            "path": path,
-            "dirs": [],
-            "notes": page,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "truncated": truncated,
-            "next_offset": offset + len(page) if truncated else None,
-        }
-    dirs, notes = [], []
-    for p in sorted(base.iterdir()):
-        if p.name.startswith("."):
-            continue
-        try:
-            if p.is_dir():
-                dirs.append(_rel(root, p) + "/")
-            elif p.suffix == ".md":
-                notes.append(_rel(root, p))
-        except ValueError:
-            # Symlink (or other entry) that resolves outside the vault.
-            continue
-    combined = [*dirs, *notes]
+            try:
+                if p.is_dir():
+                    dirs.append(_rel(root, p) + "/")
+                elif p.suffix == ".md":
+                    notes.append(_rel(root, p))
+            except ValueError:
+                # Symlink (or other entry) that resolves outside the vault.
+                continue
+        combined = [*dirs, *notes]
     total = len(combined)
     if offset > total:
         raise ValueError(f"list_notes: offset {offset} out of range (total {total})")
@@ -533,14 +476,14 @@ def _write_note_locked(
         _atomic_write(p, content)
     except OSError as exc:
         raise ValueError(f"cannot write {rel!r}: {exc.strerror or type(exc).__name__}") from exc
-    # _sha256(content): content is UTF-8-encoded on the way out, so this is the bytes on disk.
-    new_sha = _sha256(content)
+    encoded = content.encode("utf-8")
+    new_sha = _sha256_bytes(encoded)
     versioning = _git_result(root, root.name, [rel], f"vaults: {op} {rel}", new_sha)
     _invalidate_vault(root.name)
     return {
         "vault": root.name,
         "path": rel,
-        "bytes": len(content.encode()),
+        "bytes": len(encoded),
         "previous_sha256": previous_sha256,
         "sha256": new_sha,
         "updated_refreshed": refreshed,
@@ -607,11 +550,6 @@ def delete_note(vault: str, path: str, missing_ok: bool = False) -> dict:
             raise ValueError(
                 f"cannot delete {path!r}: {exc.strerror or type(exc).__name__}"
             ) from exc
-        for tmp in p.parent.glob(f".{p.name}.*.tmp"):
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
         versioning = _git_result(root, vault, [rel], f"vaults: delete {rel}", sha_before)
         if track_err and "commit_error" not in versioning:
             versioning["commit_error"] = track_err
@@ -654,7 +592,6 @@ def move_note(
                 "note has changed since the supplied expected_sha256; read it again before moving"
             )
         previous = _strict_text(previous_raw, src_path)
-        _ensure_utf8(previous)
         dst.parent.mkdir(parents=True, exist_ok=True)
         content, _ = _refresh_updated(previous)
         try:
@@ -679,15 +616,9 @@ def move_note(
         finally:
             with contextlib.suppress(Exception):
                 _invalidate_vault(vault)
-        for tmp in src.parent.glob(f".{src.name}.*.tmp"):
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
         src_rel = _rel(root, src)
         dst_rel = _rel(root, dst)
-        # _sha256(content): content is UTF-8-encoded on the way out, so this is the bytes on disk.
-        new_sha = _sha256(content)
+        new_sha = _sha256_bytes(content.encode("utf-8"))
         versioning = _git_result(
             root, vault, [dst_rel, src_rel], f"vaults: move {src_rel} -> {dst_rel}", new_sha
         )

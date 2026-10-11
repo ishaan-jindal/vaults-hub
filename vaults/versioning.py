@@ -4,14 +4,12 @@ import os
 import re
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 from vaults.config import _git_enabled, _logger
 from vaults.indexes import _invalidate_vault
 from vaults.notes import (
     _atomic_write,
-    _ensure_utf8,
     _flock,
     _note_lock,
     _note_path,
@@ -45,7 +43,7 @@ def _pathspec(rel: str) -> str:
     return f":(literal){rel}"
 
 
-# Read-only git subcommands get a shorter timeout and GIT_OPTIONAL_LOCKS=0.
+# Read-only git subcommands run with GIT_OPTIONAL_LOCKS=0 so history never blocks writers.
 _READONLY_CMDS = frozenset({"rev-parse", "log", "ls-files", "show", "status"})
 
 
@@ -57,16 +55,13 @@ def _git_lock(root: Path):
 def _git_run(root: Path, *args: str) -> subprocess.CompletedProcess:
     """Run git in the vault root with per-invocation identity. Never raises."""
     readonly = bool(args) and args[0] in _READONLY_CMDS
-    timeout = 10 if readonly else 30
-    env = None
-    if readonly:
-        env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"} if readonly else None
     try:
         return subprocess.run(
             ["git", *_GIT_IDENTITY, *args],
             cwd=root,
             capture_output=True,
-            timeout=timeout,
+            timeout=30,
             env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -92,31 +87,33 @@ def _git_ensure_excludes(root: Path) -> None:
         pass
 
 
-def _git_mode(root: Path) -> str:
-    """Return 'ours', 'external', or 'disabled', lazily initing one repo per vault.
+def _git_mode(root: Path, init: bool = True) -> str:
+    """Return 'ours', 'external', 'disabled', 'missing', or 'none'.
 
-    Call on mutation paths while holding the note's fcntl lock.
+    Adopts a vault-root .git and defers to an outer repo. With init=True
+    (mutation paths, under the note lock) it lazily inits one repo per vault;
+    with init=False (read-only history) a vault without a repo is 'none'.
     """
-    if not _git_enabled() or shutil.which("git") is None:
+    if not _git_enabled():
         return "disabled"
-    return _git_detect(root)
-
-
-def _git_detect(root: Path) -> str:
-    """Adopt a vault-root .git, defer to an outer repo, or lazily init ours."""
+    if shutil.which("git") is None:
+        return "missing"
     if (root / ".git").exists():
-        _git_ensure_excludes(root)
+        if init:
+            _git_ensure_excludes(root)
         return "ours"
     if _git_run(root, "rev-parse", "--git-dir").returncode == 0:
         return "external"  # vault nested in someone else's repo: hands off.
-    init = _git_run(root, "init", "-b", "main")
-    if init.returncode != 0:  # pre-2.28 git has no -b; retry plainly.
-        init = _git_run(root, "init")
-    if init.returncode != 0:
+    if not init:
+        return "none"
+    proc = _git_run(root, "init", "-b", "main")
+    if proc.returncode != 0:  # pre-2.28 git has no -b; retry plainly.
+        proc = _git_run(root, "init")
+    if proc.returncode != 0:
         _logger.warning(
             "vaults git init failed for %s: %s",
             root,
-            init.stderr.decode("utf-8", errors="replace")[:200],
+            proc.stderr.decode("utf-8", errors="replace")[:200],
         )
         return "disabled"
     _git_ensure_excludes(root)
@@ -128,32 +125,13 @@ def _git_commit(root: Path, rels: list[str], subject: str, sha_hex: str | None) 
 
     Skips the commit when there is nothing to commit. Fail-open by contract:
     callers surface the error string; the file write always stands.
-    Retries the whole add/status/commit sequence up to 3 times when the
-    failure mentions index.lock (concurrent git writers); never deletes
-    .git/index.lock directly. Callers must hold _git_lock(root).
+    Callers must hold _git_lock(root), which serializes this server's own
+    git writers, so an index.lock conflict only comes from an outside git.
     """
-    backoffs = (0.2, 0.5)
-    err: str | None = None
-    for attempt in range(3):
-        err = _git_commit_once(root, rels, subject, sha_hex)
-        if err is None or "index.lock" not in err:
-            return err
-        if attempt < 2:
-            time.sleep(backoffs[attempt])
-    return err
-
-
-def _git_commit_once(root: Path, rels: list[str], subject: str, sha_hex: str | None) -> str | None:
-    """Single add/status/commit attempt. Callers must hold _git_lock(root)."""
     specs = [_pathspec(r) for r in rels]
     add = _git_run(root, "add", "--", *specs)
     if add.returncode != 0:
         return add.stderr.decode("utf-8", errors="replace").strip()[:300]
-    status = _git_run(root, "status", "--porcelain", "--", *specs)
-    if status.returncode != 0:
-        return status.stderr.decode("utf-8", errors="replace").strip()[:300] or "git status failed"
-    if not status.stdout.strip():
-        return None
     msg = subject if sha_hex is None else f"{subject}\n\nSha256: {sha_hex}"
     commit = _git_run(root, "commit", "--only", "-m", msg, "--", *specs)
     if commit.returncode != 0:
@@ -161,7 +139,10 @@ def _git_commit_once(root: Path, rels: list[str], subject: str, sha_hex: str | N
             commit.stderr.decode("utf-8", errors="replace")
             + commit.stdout.decode("utf-8", errors="replace")
         ).strip()
-        if "nothing to commit" in err:
+        if any(
+            s in err
+            for s in ("nothing to commit", "no changes added to commit", "nothing added to commit")
+        ):
             return None
         return err[:300] or "git commit failed"
     return None
@@ -188,11 +169,6 @@ def _git_result(root: Path, vault: str, rels: list[str], subject: str, sha_hex: 
     return out
 
 
-def _git_tracked(root: Path, rel: str) -> bool:
-    """True if rel is in the vault repo index. Call only when mode is 'ours'."""
-    return _git_run(root, "ls-files", "--error-unmatch", "--", _pathspec(rel)).returncode == 0
-
-
 def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | None) -> str | None:
     """Commit an untracked note before delete so restore can recover it.
 
@@ -201,25 +177,16 @@ def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | No
     """
     try:
         with _git_lock(root):
-            if _git_mode(root) != "ours" or _git_tracked(root, rel):
+            if (
+                _git_mode(root) != "ours"
+                or _git_run(root, "ls-files", "--error-unmatch", "--", _pathspec(rel)).returncode
+                == 0
+            ):
                 return None
             return _git_commit(root, [rel], f"vaults: track before delete {rel}", sha_hex)
     except Exception as exc:
         _logger.warning("vaults pre-delete track failed for %s: %s", rel, exc)
         return str(exc)[:200]
-
-
-def _git_read_mode(root: Path) -> str:
-    """Read-only mode probe for history: never inits a repo ('none' if absent)."""
-    if not _git_enabled():
-        return "disabled"
-    if shutil.which("git") is None:
-        return "missing"
-    if (root / ".git").exists():
-        return "ours"
-    if _git_run(root, "rev-parse", "--git-dir").returncode == 0:
-        return "external"
-    return "none"
 
 
 def _git_mode_error(mode: str) -> str:
@@ -244,10 +211,10 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
     # Read-only: no locks taken, so history never blocks writers. The git
     # calls run with GIT_OPTIONAL_LOCKS=0 (see _git_run); a concurrent
     # commit may make the read fail, surfaced as ValueError below.
-    mode = _git_read_mode(root)
+    mode = _git_mode(root, init=False)
     if mode in ("disabled", "missing", "external"):
         raise ValueError(_git_mode_error(mode))
-    if rel is not None and (mode == "none" or not _git_tracked(root, rel)):
+    if rel is not None and mode == "none":
         return {
             "vault": vault,
             "path": path,
@@ -281,7 +248,7 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
         "truncated": truncated,
     }
     if path is not None:
-        out["untracked"] = False
+        out["untracked"] = not entries
     return out
 
 
@@ -329,7 +296,6 @@ def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None)
         if show.returncode != 0:
             raise ValueError(f"unknown revision or path not in revision: {rev!r} for {path!r}")
         text = _strict_text(show.stdout, path)
-        _ensure_utf8(text)
         p.parent.mkdir(parents=True, exist_ok=True)
         try:
             _atomic_write(p, text)

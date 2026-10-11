@@ -28,12 +28,6 @@ const SERVER_PY = join(PACKAGE_ROOT, "server.py");
 const REQUIREMENTS_TXT = join(PACKAGE_ROOT, "requirements.txt");
 
 const MIN_PYTHON = [3, 10];
-// Distribution -> importable module for the pinned requirements. Versions
-// are NOT pinned here: requirements.txt is the single source of truth
-// (parsed below), so bumping a pin there flows into the probe on both the
-// fast path and the post-install verify. This map only records names, and
-// stays correct for future pins via the normalized fallback in buildProbe.
-const IMPORT_BY_DIST = { PyYAML: "yaml", anyio: "anyio", mcp: "mcp" };
 
 // Parse only real `name==version` pins from requirements.txt; ignore blank
 // lines, comments, and anything without `==`. Distribution names are kept
@@ -60,27 +54,24 @@ function parseRequirementPins() {
   return pins;
 }
 
-// Build the `python -c` probe from parsed pins. Explicit `raise SystemExit`
-// checks (never `assert`) so `python -O` cannot strip the guard; the
-// trailing import proves the modules actually import, not just their
-// metadata. Statements are newline-joined: `if` is a compound statement and
-// cannot follow `;` in a `python -c` one-liner.
-function buildProbe(pins) {
+// Build the `python -c` probe from the requirements.txt pins. Explicit
+// `raise SystemExit` checks (never `assert`) so `python -O` cannot strip the
+// guard; the trailing import proves the modules actually import, not just
+// their metadata. Statements are newline-joined: `if` is a compound statement
+// and cannot follow `;` in a `python -c` one-liner.
+function depsProbe() {
+  const pins = parseRequirementPins();
   const lines = ["import importlib.metadata as _m"];
   for (const [name, version] of pins) {
     lines.push(
       `if _m.version('${name}')!='${version}': raise SystemExit('${name}==${version} required')`
     );
   }
-  const imports = pins.map(
-    ([name]) => IMPORT_BY_DIST[name] ?? name.toLowerCase().replace(/-/g, "_")
+  const imports = pins.map(([name]) =>
+    name === "PyYAML" ? "yaml" : name.toLowerCase().replace(/-/g, "_")
   );
   lines.push(`import ${imports.join(", ")}`);
   return lines.join("\n");
-}
-
-function depsProbe() {
-  return buildProbe(parseRequirementPins());
 }
 
 function err(msg) {
@@ -90,18 +81,14 @@ function err(msg) {
 // Run a command synchronously, capturing output (never inheriting stdio:
 // nothing here may touch stdout).
 function runCapture(cmd, args) {
-  try {
-    const res = spawnSync(cmd, args, { encoding: "utf8" });
-    return {
-      ok: res.status === 0,
-      status: res.status,
-      stdout: res.stdout ?? "",
-      stderr: res.stderr ?? "",
-      spawnError: res.error ?? null,
-    };
-  } catch (e) {
-    return { ok: false, status: null, stdout: "", stderr: "", spawnError: e };
-  }
+  const res = spawnSync(cmd, args, { encoding: "utf8" });
+  return {
+    ok: res.status === 0,
+    status: res.status,
+    stdout: res.stdout ?? "",
+    stderr: res.stderr ?? "",
+    spawnError: res.error ?? null,
+  };
 }
 
 // Resolve the Python interpreter: VAULTS_HUB_PYTHON wins when set,
@@ -114,13 +101,13 @@ function resolvePython() {
   for (const cmd of candidates) {
     const probe = runCapture(cmd, [
       "-c",
-      "import sys; print(sys.version_info[0]); print(sys.version_info[1])",
+      "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')",
     ]);
     if (probe.spawnError || !probe.ok) {
       tried.push(cmd);
       continue;
     }
-    const parts = probe.stdout.trim().split(/\s+/).map(Number);
+    const parts = probe.stdout.trim().split(".").map(Number);
     if (parts.length < 2 || parts.some(Number.isNaN)) {
       tried.push(cmd);
       continue;
@@ -143,20 +130,12 @@ function probeDeps(pythonCmd) {
   return runCapture(pythonCmd, ["-c", depsProbe()]);
 }
 
-function depsImportable(pythonCmd) {
-  return probeDeps(pythonCmd).ok;
-}
-
 // Cache root for bootstrapped venvs. XDG_CACHE_HOME wins when set,
 // otherwise ~/.cache. Keyed per interpreter minor version below so a
 // 3.11-built venv is never reused by 3.14.
 function cacheRoot() {
   if (process.env.XDG_CACHE_HOME) return join(process.env.XDG_CACHE_HOME, "vaults-hub");
   return join(homedir(), ".cache", "vaults-hub");
-}
-
-function sha256File(path) {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 // Ensure the pinned deps are importable, bootstrapping a cached venv only
@@ -179,7 +158,7 @@ function ensureInterpreter(py) {
   const markerPath = join(root, `requirements-py${py.major}.${py.minor}.sha256`);
   let wanted = null;
   try {
-    wanted = sha256File(REQUIREMENTS_TXT);
+    wanted = createHash("sha256").update(readFileSync(REQUIREMENTS_TXT)).digest("hex");
   } catch (e) {
     err(`cannot read requirements.txt at ${REQUIREMENTS_TXT}: ${e.message}`);
     process.exit(1);
@@ -194,7 +173,7 @@ function ensureInterpreter(py) {
 
   // Silent reuse: venv exists, was built from these exact requirements,
   // and still imports the deps.
-  if (marker === wanted && existsSync(venvPy) && depsImportable(venvPy)) return venvPy;
+  if (marker === wanted && existsSync(venvPy) && probeDeps(venvPy).ok) return venvPy;
 
   // Rebuild. Every message goes to stderr; the first run downloads and
   // installs the pins (~15s), so say plainly it is a one-time cost.
@@ -244,7 +223,7 @@ function ensureInterpreter(py) {
     // Another launcher renamed its venv into place first; the probe below vets it.
     rmSync(buildDir, { recursive: true, force: true });
   }
-  const verify = runCapture(venvPy, ["-c", depsProbe()]);
+  const verify = probeDeps(venvPy);
   if (!verify.ok) {
     err(`venv python at ${venvPy} still cannot import the dependencies.`);
     const detail = (verify.stderr || verify.stdout).trim();

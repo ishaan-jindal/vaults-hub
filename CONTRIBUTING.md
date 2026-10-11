@@ -46,7 +46,7 @@ Release procedure, in order:
 4. Push the `v<version>` tag from your machine (`git push origin v<version>`). Tags are pushed from your machine, never from CI.
 5. CI takes over: the `verify` job re-runs the whole CI workflow (both jobs above); the `publish` job publishes to npm via OIDC trusted publishing; the `release` job creates the GitHub Release with notes extracted from the `CHANGELOG.md` section for that version.
 
-One-time manual bootstrap: `0.2.0` must be published by hand with `npm publish` from a laptop, because npm's OIDC trusted publishing cannot create a new package name. Afterwards, configure the Trusted Publisher on npmjs.com for the `vaults-hub` package: user `ishaan-jindal`, repository `vaults-hub`, workflow filename `release.yml`, environment blank, and explicitly allow `npm publish` (new configs default to stage-only). Every release from `0.3.0` onward is then fully automated.
+Publishing relies on the Trusted Publisher configured on npmjs.com for the `vaults-hub` package: user `ishaan-jindal`, repository `vaults-hub`, workflow filename `release.yml`, environment blank, with `npm publish` explicitly allowed (new configs default to stage-only).
 
 # PR flow
 

@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from vaults.indexes import _all_notes
-from vaults.notes import _note_path, _read_text, _rel, _vault_root, list_vaults
+from vaults.notes import _note_path, _read_note, _rel, _vault_root, list_vaults
 
 
 def search_notes(
@@ -28,18 +28,12 @@ def search_notes(
         except re.error as exc:
             raise ValueError(f"invalid regular expression: {exc}") from exc
     roots = [_vault_root(vault)] if vault else [Path(v["path"]) for v in list_vaults()]
-    hits = _collect_hits(roots, query, regex, case_sensitive, limit + 1)
+    search = _search_rg if shutil.which("rg") else _search_fallback
+    hits = search(roots, query, regex, case_sensitive, limit + 1)
     truncated = len(hits) > limit
     hits = hits[:limit]
     _attach_context(hits, roots, before, after)
     return {"query": query, "matches": hits, "limit": limit, "truncated": truncated}
-
-
-def _collect_hits(roots, query, regex, case_sensitive, limit) -> list[dict]:
-    """Collect raw matches via rg, or the Python fallback when rg is absent."""
-    if shutil.which("rg"):
-        return _search_rg(roots, query, regex, case_sensitive, limit)
-    return _search_fallback(roots, query, regex, case_sensitive, limit)
 
 
 def _search_rg(roots, query, regex, case_sensitive, limit) -> list[dict]:
@@ -122,7 +116,7 @@ def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
             except ValueError:
                 continue
             try:
-                lines = _read_text(p).splitlines()
+                lines = _read_note(p)[1].splitlines()
             except OSError:
                 continue
             file_hits = 0
@@ -157,7 +151,7 @@ def _attach_context(hits, roots, before, after) -> None:
         if key not in cache:
             base = vault_to_root.get(hit["vault"])
             try:
-                cache[key] = _read_text(_note_path(base, hit["path"])).splitlines()
+                cache[key] = _read_note(_note_path(base, hit["path"]))[1].splitlines()
             except (OSError, ValueError, AttributeError):
                 cache[key] = []
         lines = cache[key]

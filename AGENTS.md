@@ -45,7 +45,7 @@ Ruff isn't installed in `.venv`, so use `uvx` with the CI-pinned version. Run th
 
 1. Add it in `vaults/server.py` with all four `ToolAnnotations` hints set explicitly as booleans. `openWorldHint` is always `False`.
 2. Put the logic in the relevant `vaults/*.py` module and keep the wrapper thin.
-3. Update `EXPECTED_TOOLS` in `smoke_test.py`, the hard-coded `14` in `npm_launcher_test.py`, and the tool count and tables in `README.md`.
+3. Update `EXPECTED_TOOLS` in `smoke_test.py` (`npm_launcher_test.py` imports it) and the tool count and tables in `README.md`.
 4. Add a smoke-test assertion that covers the new behavior.
 5. Add a `CHANGELOG.md` entry.
 6. MCP clients cache `tools/list` at initialize, so restart them to see schema changes.

@@ -123,7 +123,7 @@ is gated on `confirm` instead):
 | `read_note` | R | Read a note: frontmatter, content, wiki-links, backlinks, unresolved links |
 | `write_note` | M | Create or atomically overwrite a note (`expected_sha256` for optimistic concurrency) |
 | `append_note` | M | Append text to a note (created if missing), atomic write, optional `expected_sha256` |
-| `delete_note` | M | Delete a note (`missing_ok=True` to tolerate absence); cleans up sibling tmp files (lock files are left in place) |
+| `delete_note` | M | Delete a note (`missing_ok=True` to tolerate absence); lock files are left in place |
 | `move_note` | M | Move/rename a note (copy+delete, not atomic); errors if src missing or dst exists; honors `expected_sha256`; refreshes `updated:` |
 | `list_tags` | R | Tag counts per vault from cached frontmatter (one vault or all) |
 | `search_notes` | R | Full-text search of `.md` notes via ripgrep (or Python fallback) across one vault or all, with before/after context lines; `limit` 1–200 with a `truncated` flag |
@@ -236,8 +236,8 @@ Each vault is a local git repo (one per vault root), maintained automatically:
   `restore` then return clear errors.
 - **`history(vault, path?, limit?)`** lists `[{sha, date, message}]` (newest
   first, limit clamped 1–200) plus a `truncated` flag when more commits exist
-  beyond the page; an untracked path returns `[]` with
-  `untracked:true`. **`restore(vault, path, rev, expected_sha256?)`** writes
+  beyond the page; a deleted note keeps its history, and a path that was
+  never committed returns `[]` with `untracked:true`. **`restore(vault, path, rev, expected_sha256?)`** writes
   `git show rev:path` back to disk atomically (snapshotting dirty state
   first), echoes the revision as `restored_from`, and can
   recreate deleted notes.
@@ -264,7 +264,7 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 14 tools) <
   `notes.py` (path validation, UTF-8 checks, `fcntl` locks, atomic writes,
   SHA-256 optimistic concurrency, frontmatter/wiki-link helpers, note CRUD,
   vault creation),
-  `indexes.py` (in-memory backlink/frontmatter indexes with mtime-based
+  `indexes.py` (in-memory backlink/tag indexes with mtime-based
   invalidation), `search.py` (ripgrep + Python-fallback search),
   `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 14
   tools). Root `server.py` is a thin shim so `python
