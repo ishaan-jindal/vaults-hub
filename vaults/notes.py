@@ -84,11 +84,6 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _sha256(text: str) -> str:
-    """Hash content being written; its UTF-8 encoding is exactly what lands on disk."""
-    return _sha256_bytes(text.encode("utf-8"))
-
-
 def _ensure_utf8(content: str) -> None:
     """Reject lone surrogates and NUL bytes. Raises ValueError, never UnicodeEncodeError."""
     if "\x00" in content:
@@ -113,11 +108,6 @@ def _read_note(path: Path) -> tuple[bytes, str]:
     if "\r" in text:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
     return raw, text
-
-
-def _read_text(path: Path) -> str:
-    """Read a note as UTF-8, replacing invalid bytes instead of crashing."""
-    return _read_note(path)[1]
 
 
 def _strict_text(raw: bytes, path: str) -> str:
@@ -503,14 +493,14 @@ def _write_note_locked(
         _atomic_write(p, content)
     except OSError as exc:
         raise ValueError(f"cannot write {rel!r}: {exc.strerror or type(exc).__name__}") from exc
-    # _sha256(content): content is UTF-8-encoded on the way out, so this is the bytes on disk.
-    new_sha = _sha256(content)
+    encoded = content.encode("utf-8")
+    new_sha = _sha256_bytes(encoded)
     versioning = _git_result(root, root.name, [rel], f"vaults: {op} {rel}", new_sha)
     _invalidate_vault(root.name)
     return {
         "vault": root.name,
         "path": rel,
-        "bytes": len(content.encode()),
+        "bytes": len(encoded),
         "previous_sha256": previous_sha256,
         "sha256": new_sha,
         "updated_refreshed": refreshed,
@@ -645,8 +635,7 @@ def move_note(
                 _invalidate_vault(vault)
         src_rel = _rel(root, src)
         dst_rel = _rel(root, dst)
-        # _sha256(content): content is UTF-8-encoded on the way out, so this is the bytes on disk.
-        new_sha = _sha256(content)
+        new_sha = _sha256_bytes(content.encode("utf-8"))
         versioning = _git_result(
             root, vault, [dst_rel, src_rel], f"vaults: move {src_rel} -> {dst_rel}", new_sha
         )

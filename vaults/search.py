@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from vaults.indexes import _all_notes
-from vaults.notes import _note_path, _read_text, _rel, _vault_root, list_vaults
+from vaults.notes import _note_path, _read_note, _rel, _vault_root, list_vaults
 
 
 def search_notes(
@@ -122,7 +122,7 @@ def _search_fallback(roots, query, regex, case_sensitive, limit) -> list[dict]:
             except ValueError:
                 continue
             try:
-                lines = _read_text(p).splitlines()
+                lines = _read_note(p)[1].splitlines()
             except OSError:
                 continue
             file_hits = 0
@@ -157,7 +157,7 @@ def _attach_context(hits, roots, before, after) -> None:
         if key not in cache:
             base = vault_to_root.get(hit["vault"])
             try:
-                cache[key] = _read_text(_note_path(base, hit["path"])).splitlines()
+                cache[key] = _read_note(_note_path(base, hit["path"]))[1].splitlines()
             except (OSError, ValueError, AttributeError):
                 cache[key] = []
         lines = cache[key]

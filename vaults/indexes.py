@@ -7,7 +7,7 @@ from pathlib import Path
 
 from vaults.notes import (
     WIKI_LINK_RE,
-    _read_text,
+    _read_note,
     _rel,
     _resolve_link_fast,
     _split_frontmatter,
@@ -70,7 +70,7 @@ def _rebuild_indexes(root: Path, vault: str, scan: list[Path]) -> None:
             except OSError:
                 continue
             try:
-                text = _read_text(p)
+                text = _read_note(p)[1]
             except OSError:
                 tag_index[rel] = []
                 targets_map[rel] = set()
