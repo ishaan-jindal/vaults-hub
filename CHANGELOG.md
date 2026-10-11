@@ -33,6 +33,16 @@ All notable changes to this project will be documented in this file.
 - Contributors: `smoke_test.py --only=rg-fallback` is gone, since the main run
   already covers the ripgrep-absent leg, and a release now bumps three version
   literals instead of six.
+- `history` for a deleted note returns its commits instead of
+  `untracked:true`, so `restore` has a revision to use.
+- With git off `PATH`, writes report `versioning: "missing"` and
+  `history`/`restore` say git is missing instead of blaming `VAULTS_HUB_GIT=0`.
+- `delete_vault` removes the tree in place; a crash mid-delete can leave a
+  partially deleted vault visible.
+- A quoted bracket string such as `tags: "[a, b]"` is no longer unwrapped;
+  YAML lists and `a, b` strings parse as before.
+- `delete_note` and `move_note` no longer sweep stray temp files; failed
+  writes already remove their own.
 
 ## [0.2.0] - 2026-09-27
 
