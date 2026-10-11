@@ -264,7 +264,7 @@ opencode (MCP client, stdio) <-> vaults/server.py (FastMCP "vaults", 14 tools) <
   `notes.py` (path validation, UTF-8 checks, `fcntl` locks, atomic writes,
   SHA-256 optimistic concurrency, frontmatter/wiki-link helpers, note CRUD,
   vault creation),
-  `indexes.py` (in-memory backlink/frontmatter indexes with mtime-based
+  `indexes.py` (in-memory backlink/tag indexes with mtime-based
   invalidation), `search.py` (ripgrep + Python-fallback search),
   `versioning.py` (per-vault git layer), and `server.py` (FastMCP app, 14
   tools). Root `server.py` is a thin shim so `python

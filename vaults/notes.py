@@ -205,34 +205,14 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _normalize_tags(value) -> list[str]:
-    """Coerce frontmatter `tags` to a sorted list[str].
-
-    Accepts a YAML string or list (documents the string form explicitly):
-    - plain string with no comma/brackets (e.g. ``d``) -> ``["d"]``
-    - comma-separated or bracketed string -> split on commas
-    - list -> coerce each item to str
-    Empty/missing -> ``[]``.
-    """
+    """Coerce frontmatter `tags` (YAML list, `a, b` string, or scalar) to a sorted list[str]."""
     if value is None:
         return []
     if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return []
-        if "," not in s and "[" not in s and "]" not in s:
-            return [s]
-        inner = s.strip().strip("[]")
-        parts = [p.strip().strip("'\"") for p in inner.split(",")]
-        return sorted(p for p in parts if p)
-    if isinstance(value, list):
-        out = []
-        for item in value:
-            t = str(item).strip()
-            if t:
-                out.append(t)
-        return sorted(out)
-    s = str(value).strip()
-    return [s] if s else []
+        value = value.split(",")
+    elif not isinstance(value, list):
+        value = [value]
+    return sorted(t for t in (str(v).strip() for v in value) if t)
 
 
 def _normalize_frontmatter(data: dict) -> dict:
