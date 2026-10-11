@@ -6,7 +6,7 @@ import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VAULTS_ROOT = Path(os.environ.get("VAULTS_ROOT", str(Path.home() / ".vaults"))).resolve()
+VAULTS_ROOT = Path(os.environ.get("VAULTS_ROOT") or Path.home() / ".vaults").expanduser().resolve()
 
 _logger = logging.getLogger("vaults")
 
@@ -56,8 +56,7 @@ def _parse_args(argv=None):
 
 def _resolve_vaults_root(cli_value: str | None) -> Path:
     """Resolve the vaults root, creating it on startup when missing."""
-    raw = cli_value or os.environ.get("VAULTS_ROOT") or str(Path.home() / ".vaults")
-    root = Path(raw).expanduser().resolve()
+    root = Path(cli_value).expanduser().resolve() if cli_value else VAULTS_ROOT
     try:
         root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
