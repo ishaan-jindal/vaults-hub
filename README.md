@@ -236,8 +236,8 @@ Each vault is a local git repo (one per vault root), maintained automatically:
   `restore` then return clear errors.
 - **`history(vault, path?, limit?)`** lists `[{sha, date, message}]` (newest
   first, limit clamped 1–200) plus a `truncated` flag when more commits exist
-  beyond the page; an untracked path returns `[]` with
-  `untracked:true`. **`restore(vault, path, rev, expected_sha256?)`** writes
+  beyond the page; a deleted note keeps its history, and a path that was
+  never committed returns `[]` with `untracked:true`. **`restore(vault, path, rev, expected_sha256?)`** writes
   `git show rev:path` back to disk atomically (snapshotting dirty state
   first), echoes the revision as `restored_from`, and can
   recreate deleted notes.

@@ -235,7 +235,7 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
     mode = _git_mode(root, init=False)
     if mode in ("disabled", "missing", "external"):
         raise ValueError(_git_mode_error(mode))
-    if rel is not None and (mode == "none" or not _git_tracked(root, rel)):
+    if rel is not None and mode == "none":
         return {
             "vault": vault,
             "path": path,
@@ -269,7 +269,7 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
         "truncated": truncated,
     }
     if path is not None:
-        out["untracked"] = False
+        out["untracked"] = not entries
     return out
 
 

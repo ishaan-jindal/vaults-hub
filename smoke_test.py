@@ -1147,6 +1147,13 @@ async def main() -> int:
                 assert fresh_hist["truncated"] is False, fresh_hist
                 await session.call_tool("delete_note", {"vault": "Termchat", "path": "Vcs.md"})
                 assert not (vaults / "Termchat" / "Vcs.md").exists()
+                # A deleted note keeps its history, so restore has a sha to use.
+                gone_hist = out(
+                    await session.call_tool("history", {"vault": "Termchat", "path": "Vcs.md"})
+                )
+                assert gone_hist["untracked"] is False, gone_hist
+                assert "delete" in gone_hist["history"][0]["message"], gone_hist
+                assert gone_hist["history"][1:] == hist2["history"], gone_hist
                 first_sha = hist2["history"][-1]["sha"]
                 restored = out(
                     await session.call_tool(
