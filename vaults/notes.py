@@ -385,19 +385,11 @@ def delete_vault(vault: str, confirm: str) -> dict:
     notes_removed = len(_all_notes(target))
     git_history = "removed" if (target / ".git").exists() else "none"
 
-    trash = config.VAULTS_ROOT / f".{name}.deleted-{os.getpid()}"
-    n = 0
-    while trash.exists():
-        n += 1
-        trash = config.VAULTS_ROOT / f".{name}.deleted-{os.getpid()}.{n}"
-    # ponytail: rename cuts the vault out of the namespace atomically so rivals see
-    # "unknown vault" not ENOENT; _git_lock is belt-and-braces (its file dies with the
-    # tree) and a crash leaves a hidden `.name.deleted-<pid>` dir that list_vaults
-    # filters out and we deliberately never auto-clean.
+    # ponytail: rmtree in place, so a concurrent call or a crash mid-delete can see
+    # a partially deleted vault; rename to a hidden dir first if that ever matters.
     with _git_lock(target):
-        os.rename(target, trash)
+        shutil.rmtree(target)
         _invalidate_vault(name)
-        shutil.rmtree(trash)
     return {
         "vault": name,
         "path": str(target),
