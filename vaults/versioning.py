@@ -91,31 +91,33 @@ def _git_ensure_excludes(root: Path) -> None:
         pass
 
 
-def _git_mode(root: Path) -> str:
-    """Return 'ours', 'external', or 'disabled', lazily initing one repo per vault.
+def _git_mode(root: Path, init: bool = True) -> str:
+    """Return 'ours', 'external', 'disabled', 'missing', or 'none'.
 
-    Call on mutation paths while holding the note's fcntl lock.
+    Adopts a vault-root .git and defers to an outer repo. With init=True
+    (mutation paths, under the note lock) it lazily inits one repo per vault;
+    with init=False (read-only history) a vault without a repo is 'none'.
     """
-    if not _git_enabled() or shutil.which("git") is None:
+    if not _git_enabled():
         return "disabled"
-    return _git_detect(root)
-
-
-def _git_detect(root: Path) -> str:
-    """Adopt a vault-root .git, defer to an outer repo, or lazily init ours."""
+    if shutil.which("git") is None:
+        return "missing"
     if (root / ".git").exists():
-        _git_ensure_excludes(root)
+        if init:
+            _git_ensure_excludes(root)
         return "ours"
     if _git_run(root, "rev-parse", "--git-dir").returncode == 0:
         return "external"  # vault nested in someone else's repo: hands off.
-    init = _git_run(root, "init", "-b", "main")
-    if init.returncode != 0:  # pre-2.28 git has no -b; retry plainly.
-        init = _git_run(root, "init")
-    if init.returncode != 0:
+    if not init:
+        return "none"
+    proc = _git_run(root, "init", "-b", "main")
+    if proc.returncode != 0:  # pre-2.28 git has no -b; retry plainly.
+        proc = _git_run(root, "init")
+    if proc.returncode != 0:
         _logger.warning(
             "vaults git init failed for %s: %s",
             root,
-            init.stderr.decode("utf-8", errors="replace")[:200],
+            proc.stderr.decode("utf-8", errors="replace")[:200],
         )
         return "disabled"
     _git_ensure_excludes(root)
@@ -208,19 +210,6 @@ def _git_track_before_delete(root: Path, vault: str, rel: str, sha_hex: str | No
         return str(exc)[:200]
 
 
-def _git_read_mode(root: Path) -> str:
-    """Read-only mode probe for history: never inits a repo ('none' if absent)."""
-    if not _git_enabled():
-        return "disabled"
-    if shutil.which("git") is None:
-        return "missing"
-    if (root / ".git").exists():
-        return "ours"
-    if _git_run(root, "rev-parse", "--git-dir").returncode == 0:
-        return "external"
-    return "none"
-
-
 def _git_mode_error(mode: str) -> str:
     if mode == "disabled":
         return "versioning is disabled (VAULTS_HUB_GIT=0); re-run with it unset to enable"
@@ -243,7 +232,7 @@ def history(vault: str, path: str | None = None, limit: int = 50) -> dict:
     # Read-only: no locks taken, so history never blocks writers. The git
     # calls run with GIT_OPTIONAL_LOCKS=0 (see _git_run); a concurrent
     # commit may make the read fail, surfaced as ValueError below.
-    mode = _git_read_mode(root)
+    mode = _git_mode(root, init=False)
     if mode in ("disabled", "missing", "external"):
         raise ValueError(_git_mode_error(mode))
     if rel is not None and (mode == "none" or not _git_tracked(root, rel)):
