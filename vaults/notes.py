@@ -423,8 +423,6 @@ def list_notes(
                 parts = p.resolve().relative_to(root).parts
             except ValueError:
                 continue
-            if ".obsidian" in parts:
-                continue
             if any(part.startswith(".") for part in parts):
                 continue
             notes.append(p.resolve().relative_to(root).as_posix())
@@ -607,11 +605,6 @@ def delete_note(vault: str, path: str, missing_ok: bool = False) -> dict:
             raise ValueError(
                 f"cannot delete {path!r}: {exc.strerror or type(exc).__name__}"
             ) from exc
-        for tmp in p.parent.glob(f".{p.name}.*.tmp"):
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
         versioning = _git_result(root, vault, [rel], f"vaults: delete {rel}", sha_before)
         if track_err and "commit_error" not in versioning:
             versioning["commit_error"] = track_err
@@ -654,7 +647,6 @@ def move_note(
                 "note has changed since the supplied expected_sha256; read it again before moving"
             )
         previous = _strict_text(previous_raw, src_path)
-        _ensure_utf8(previous)
         dst.parent.mkdir(parents=True, exist_ok=True)
         content, _ = _refresh_updated(previous)
         try:
@@ -679,11 +671,6 @@ def move_note(
         finally:
             with contextlib.suppress(Exception):
                 _invalidate_vault(vault)
-        for tmp in src.parent.glob(f".{src.name}.*.tmp"):
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
         src_rel = _rel(root, src)
         dst_rel = _rel(root, dst)
         # _sha256(content): content is UTF-8-encoded on the way out, so this is the bytes on disk.

@@ -226,8 +226,7 @@ async def append_note(
 @mcp.tool(
     description=(
         "Delete a note file. Errors when missing unless missing_ok=True. "
-        "Sibling tmp files are cleaned up best-effort; lock files are "
-        "intentionally left in place."
+        "Lock files are intentionally left in place."
     ),
     annotations=ToolAnnotations(
         title="Delete note",

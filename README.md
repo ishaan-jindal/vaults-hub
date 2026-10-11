@@ -123,7 +123,7 @@ is gated on `confirm` instead):
 | `read_note` | R | Read a note: frontmatter, content, wiki-links, backlinks, unresolved links |
 | `write_note` | M | Create or atomically overwrite a note (`expected_sha256` for optimistic concurrency) |
 | `append_note` | M | Append text to a note (created if missing), atomic write, optional `expected_sha256` |
-| `delete_note` | M | Delete a note (`missing_ok=True` to tolerate absence); cleans up sibling tmp files (lock files are left in place) |
+| `delete_note` | M | Delete a note (`missing_ok=True` to tolerate absence); lock files are left in place |
 | `move_note` | M | Move/rename a note (copy+delete, not atomic); errors if src missing or dst exists; honors `expected_sha256`; refreshes `updated:` |
 | `list_tags` | R | Tag counts per vault from cached frontmatter (one vault or all) |
 | `search_notes` | R | Full-text search of `.md` notes via ripgrep (or Python fallback) across one vault or all, with before/after context lines; `limit` 1–200 with a `truncated` flag |

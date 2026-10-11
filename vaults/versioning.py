@@ -11,7 +11,6 @@ from vaults.config import _git_enabled, _logger
 from vaults.indexes import _invalidate_vault
 from vaults.notes import (
     _atomic_write,
-    _ensure_utf8,
     _flock,
     _note_lock,
     _note_path,
@@ -329,7 +328,6 @@ def restore(vault: str, path: str, rev: str, expected_sha256: str | None = None)
         if show.returncode != 0:
             raise ValueError(f"unknown revision or path not in revision: {rev!r} for {path!r}")
         text = _strict_text(show.stdout, path)
-        _ensure_utf8(text)
         p.parent.mkdir(parents=True, exist_ok=True)
         try:
             _atomic_write(p, text)
