@@ -70,33 +70,16 @@ def err_text(res):
 
 
 def _path_without_rg(scratch: Path) -> str:
-    """A PATH with ripgrep hidden, so the server falls back to pure-Python search.
+    """A PATH holding only git, so the server falls back to pure-Python search.
 
-    PATH is directory-grained, so when rg lives alongside git (both are in
-    /usr/bin on ubuntu runners) the whole dir must go; git is then kept
-    reachable via one symlink in a scratch dir. Only `rg`/`git` matter here:
-    the server is spawned via an absolute sys.executable, so nothing else on
-    PATH is needed by this leg.
+    The server is spawned via an absolute sys.executable, so it needs nothing
+    else on PATH.
     """
-    rg = shutil.which("rg")
-    if rg is None:
-        return os.environ.get("PATH", "")
-    # Every PATH dir holding an executable `rg` must go: which() only reports
-    # the first, but the server would happily find the second.
-    rg_dirs = {
-        d
-        for d in os.environ.get("PATH", "").split(os.pathsep)
-        if d and os.path.isfile(os.path.join(d, "rg")) and os.access(os.path.join(d, "rg"), os.X_OK)
-    }
-    kept = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d and d not in rg_dirs]
+    scratch.mkdir(parents=True, exist_ok=True)
     git = shutil.which("git")
-    if git is not None and str(Path(git).parent) in rg_dirs:
-        scratch.mkdir(parents=True, exist_ok=True)
-        link = scratch / "git"
-        if not link.exists():
-            os.symlink(git, link)
-        kept.insert(0, str(scratch))
-    return os.pathsep.join(kept)
+    if git is not None:
+        os.symlink(git, scratch / "git")
+    return str(scratch)
 
 
 async def _write_search_corpus(session, vaults: Path) -> None:
