@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add `skills/vaults-hub/SKILL.md`: plug-and-go Agent Skill for the
+  vaults-hub MCP server (tool table, happy-path snippet, usage rules).
+
 ## [0.2.1] - 2026-10-11
 
 - Wiki-link resolution is confined to the vault: path targets that escape it
