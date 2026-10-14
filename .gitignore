@@ -15,3 +15,8 @@ build/
 
 # node (npm wrapper)
 node_modules/
+
+# local AI agent skills/conventions (discovery dirs, not source of truth)
+.opencode/
+.claude/
+.agents/
