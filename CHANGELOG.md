@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add `skills/vaults-sync/SKILL.md`: workflow skill for mid-session
+  structured-doc creation — resolves vault, surveys existing notes,
+  enforces read-before-write with `expected_sha256`, ships frontmatter
+  + wiki-link + tag conventions and ADR / how-to / spec skeletons.
+- Add `install.sh`: dry-run-by-default multi-client installer that
+  registers the `vaults` MCP server in OpenCode, Claude Code, Claude
+  Desktop, Cursor, and Codex; symlinks `vaults-sync` into the global
+  skills dir; and drops an `AGENTS.md` auto-load hint at each client's
+  config root.
+- README: new "Install via your AI agent" section pointing at the
+  script with a copy-pasteable prompt for AI assistants.
 - Add `skills/vaults-hub/SKILL.md`: plug-and-go Agent Skill for the
   vaults-hub MCP server (tool table, happy-path snippet, usage rules).
 

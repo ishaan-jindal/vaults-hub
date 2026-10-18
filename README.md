@@ -58,13 +58,15 @@ copy any hardcoded home directory). The npx form is recommended:
 ```jsonc
 {
   "mcp": {
-    "vaults": {
-      "type": "local",
-      "command": "npx",
-      "args": ["-y", "vaults-hub"],
-      // Pick ONE way to point at your vaults (flag wins over env var):
-      "environment": {
-        "VAULTS_ROOT": "<path-to-your-vaults>"
+    "servers": {
+      "vaults": {
+        "type": "local",
+        "command": "npx",
+        "args": ["-y", "vaults-hub"],
+        // Pick ONE way to point at your vaults (flag wins over env var):
+        "environment": {
+          "VAULTS_ROOT": "<path-to-your-vaults>"
+        }
       }
     }
   }
@@ -91,6 +93,33 @@ actual paths on your machine):
   }
 }
 ```
+
+## Install via your AI agent
+
+The fastest onboarding: tell your agent to set it up. Paste this into
+Claude Code, OpenCode, Cursor, or Codex:
+
+> Please go to https://github.com/ishaan-jindal/vaults-hub, run the
+> `install.sh` script at the repo root with `--apply`, and confirm the
+> `vaults` MCP server is reachable.
+
+The script detects which MCP clients you have installed (OpenCode,
+Claude Code, Claude Desktop, Cursor, Codex), registers the `vaults`
+MCP server in each, symlinks the `vaults-sync` skill into the global
+skills directory, and drops a short `AGENTS.md` hint so every session
+auto-loads the skill when you ask to write or sync notes.
+
+To run it yourself (clone first so you can inspect):
+
+```bash
+git clone https://github.com/ishaan-jindal/vaults-hub.git
+cd vaults-hub
+./install.sh --help        # see what it will do
+./install.sh --apply       # actually write configs
+```
+
+The script is dry-run by default — no config is touched without
+`--apply`, and every JSON / TOML edit is merged, never overwritten.
 
 ## Usage examples
 
